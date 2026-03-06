@@ -4,18 +4,18 @@
 ╚══════════════════════════════════════════╝
 """
 
+import os
 from flask import Flask, jsonify
-from config import PORT
 
 web_app = Flask(__name__)
 
 
-@web_app.route("/health", methods=["GET"])
+@web_app.route("/health", methods=["GET", "HEAD"])
 def health():
     return jsonify({"status": "ok", "bot": "Serena Downloader Bot"}), 200
 
 
-@web_app.route("/", methods=["GET"])
+@web_app.route("/", methods=["GET", "HEAD"])
 def index():
     return jsonify({
         "name": "Serena Downloader Bot",
@@ -27,4 +27,5 @@ def index():
 
 
 def run_web():
-    web_app.run(host="0.0.0.0", port=PORT, debug=False)
+    port = int(os.environ.get("PORT", "10000"))
+    web_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
