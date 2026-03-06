@@ -6,7 +6,9 @@
 
 import asyncio
 import os
+import sys
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 import database as db
 from utils.decorators import owner_only, ensure_registered
@@ -157,15 +159,20 @@ async def broadcast_cmd(client: Client, message: Message):
     sent = 0
     failed = 0
     for user in users:
-        try:
-            await client.send_message(
-                user["user_id"],
-                f"📢 **Broadcast Message**\n\n{text}"
-            )
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
+        for attempt in range(2):
+            try:
+                await client.send_message(
+                    user["user_id"],
+                    f"📢 **Broadcast Message**\n\n{text}"
+                )
+                sent += 1
+                await asyncio.sleep(0.08)
+                break
+            except FloodWait as e:
+                await asyncio.sleep(e.value + 2)
+            except Exception:
+                failed += 1
+                break
 
     await status_msg.edit_text(
         f"✅ **Broadcast Complete!**\n\n"
@@ -229,4 +236,4 @@ async def banned_cmd(client: Client, message: Message):
 async def restart_cmd(client: Client, message: Message):
     await message.reply_text("🔄 **Restarting bot...** Be right back!")
     await asyncio.sleep(1)
-    os.execv("/usr/bin/python3", ["python3", "bot.py"])
+    os.execv(sys.executable, [sys.executable, os.path.abspath("bot.py")])
