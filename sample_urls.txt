@@ -1,0 +1,25 @@
+# Serena Downloader Bot — Sample URLs for Bulk Download
+# Send this file to the bot to test bulk downloading.
+# One URL per line. Lines starting with # are comments.
+
+# YouTube
+https://www.youtube.com/watch?v=dQw4w9WgXcQ
+https://youtu.be/dQw4w9WgXcQ
+
+# TikTok
+https://www.tiktok.com/@username/video/1234567890
+
+# Twitter/X
+https://twitter.com/username/status/1234567890
+
+# Instagram
+https://www.instagram.com/p/ABC123/
+
+# Direct video
+https://sample-videos.com/video321/mp4/720/big_buck_bunny_720p_1mb.mp4
+
+# Direct audio
+https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3
+
+# Direct image
+https://www.sample-videos.com/img/Sample-jpg-image-50kb.jpg
