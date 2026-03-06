@@ -13,7 +13,7 @@ OWNER_IDS: List[int] = [
     int(x.strip()) for x in os.environ.get("OWNER_IDS", "1598576202").split(",")
     if x.strip().isdigit()
 ]
-OWNER_USERNAME: str = os.environ.get("OWNER_USERNAME", "Xioqui_Xan")
+OWNER_USERNAME: str = os.environ.get("OWNER_USERNAME", "Xioqui_xin")
 SUPPORT_USERNAME: str = os.environ.get("SUPPORT_USERNAME", "TechnicalSerena")
 FORCE_SUB_CHANNEL: str = os.environ.get("FORCE_SUB_CHANNEL", "serenaunzipbot")
 
@@ -24,10 +24,12 @@ PREMIUM_LIMIT: int = int(os.environ.get("PREMIUM_LIMIT", "50"))
 DB_PATH: str = os.environ.get("DB_PATH", "/tmp/serena_db/bot.db")
 DL_DIR: str = os.environ.get("DL_DIR", "/tmp/serena_dl")
 
-# ── Cookies: Render stores multiline env as literal \n — fixed in helpers ──
 YT_COOKIES: str = os.environ.get("YT_COOKIES", "")
 INSTAGRAM_COOKIES: str = os.environ.get("INSTAGRAM_COOKIES", "")
 TERABOX_COOKIES: str = os.environ.get("TERABOX_COOKIES", "")
+
+# Optional proxy for YouTube (format: http://user:pass@host:port or http://host:port)
+YT_PROXY: str = os.environ.get("YT_PROXY", "")
 
 PORT: int = int(os.environ.get("PORT", "10000"))
 
@@ -52,4 +54,4 @@ REACTION_EMOJIS = [
     "😎","🤙","💪","🙌"
 ]
 
-BOT_LOCK: bool = False  # runtime toggle — do not set from env
+BOT_LOCK: bool = False
