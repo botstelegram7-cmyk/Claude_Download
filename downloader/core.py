@@ -1,8 +1,12 @@
 """
 Serena Downloader Bot - Core Downloader
-Fix: YouTube bot detection bypass using android client + po_token workaround
+YouTube fix: exact method from working reference code
+- format: best[ext=mp4]/best
+- Chrome User-Agent header
+- Direct proxy on each request
+- No complex postprocessors
 """
-import os, sys, asyncio, subprocess, uuid, time, shutil, zipfile, json
+import os, sys, asyncio, subprocess, uuid, time, shutil, zipfile, json, requests
 from typing import Optional, Callable
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -13,6 +17,9 @@ from config import DL_DIR
 from utils.helpers import detect_url_type, clean_filename
 
 os.makedirs(DL_DIR, exist_ok=True)
+
+# Chrome User-Agent — same as working reference code
+CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
 
 # ─────────────────────────────────────────
@@ -105,137 +112,120 @@ async def check_yt_cookies_status() -> dict:
     finally:
         try: os.remove(path)
         except: pass
-
     if valid == 0 and expired > 0:
         return {"valid": False, "expired": True,
-                "message": f"⚠️ All **{expired}** entries are **expired**! Export fresh cookies."}
+                "message": f"⚠️ All **{expired}** entries are **expired**!"}
     elif valid > 0:
         exp_str = datetime.utcfromtimestamp(nearest).strftime("%Y-%m-%d") if nearest else "session"
         return {"valid": True, "expired": False,
-                "message": f"✅ Valid! `{valid}` active entries. Nearest expiry: `{exp_str}`"}
-    return {"valid": False, "expired": False,
-            "message": "❌ No valid cookie entries found."}
+                "message": f"✅ Valid! `{valid}` entries. Expiry: `{exp_str}`"}
+    return {"valid": False, "expired": False, "message": "❌ No valid entries found."}
 
 
 # ─────────────────────────────────────────
-#  yt-dlp option builders
+#  yt-dlp opts builders
 # ─────────────────────────────────────────
 
-def _base_opts(out_dir: str, fmt: str, postprocessors: list) -> dict:
-    from config import YT_PROXY
+def _yt_opts(out_dir: str, quality: str, audio_only: bool,
+             cookie_file: Optional[str], hook, proxy: str) -> dict:
+    """
+    YouTube opts — based on working reference code.
+    Key: best[ext=mp4]/best format + Chrome UA + proxy.
+    No FFmpegMetadata, no complex merge — avoids postprocessing errors.
+    """
+    if audio_only:
+        fmt = "bestaudio/best"
+    else:
+        q_map = {
+            "144p":  "best[ext=mp4][height<=144]/best[height<=144]/best",
+            "360p":  "best[ext=mp4][height<=360]/best[height<=360]/best",
+            "720p":  "best[ext=mp4][height<=720]/best[height<=720]/best",
+            "1080p": "best[ext=mp4][height<=1080]/best[height<=1080]/best",
+            "best":  "best[ext=mp4]/best",
+        }
+        fmt = q_map.get(quality, "best[ext=mp4]/best")
+
     opts = {
         "format": fmt,
         "outtmpl": os.path.join(out_dir, "%(title).80s.%(ext)s"),
-        "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": False,
         "writethumbnail": True,
-        "postprocessors": postprocessors,
+        "postprocessors": [],           # ← empty, no FFmpegMetadata
+        "merge_output_format": "mp4",
         "retries": 10,
         "fragment_retries": 10,
-        "file_access_retries": 3,
         "sleep_interval": 1,
         "max_sleep_interval": 5,
         "socket_timeout": 30,
-        "http_chunk_size": 10485760,
+        "http_headers": {"User-Agent": CHROME_UA},  # ← Chrome UA
     }
-    if YT_PROXY:
-        opts["proxy"] = YT_PROXY
+
+    if proxy:
+        opts["proxy"] = proxy           # ← direct proxy
+
+    if cookie_file and os.path.exists(cookie_file):
+        opts["cookiefile"] = cookie_file
+
+    if audio_only:
+        opts["postprocessors"] = [
+            {"key": "FFmpegExtractAudio",
+             "preferredcodec": "mp3",
+             "preferredquality": "192"},
+        ]
+
+    if hook:
+        opts["progress_hooks"] = [hook]
+
     return opts
 
 
-def _yt_opts_android(out_dir: str, fmt: str, cookie_file: Optional[str], hook) -> dict:
-    """
-    Strategy 1: Android client — bypasses bot detection without cookies.
-    This is the most reliable method on server IPs.
-    """
-    opts = _base_opts(out_dir, fmt, [])
-    opts["extractor_args"] = {
-        "youtube": {
-            "player_client": ["android"],
-            "player_skip": ["webpage", "configs"],
-        }
+def _generic_opts(out_dir: str, cookie_file: Optional[str], hook) -> dict:
+    """For Instagram, TikTok, Twitter, Facebook, etc."""
+    opts = {
+        "format": "best[ext=mp4]/best",
+        "outtmpl": os.path.join(out_dir, "%(title).80s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": False,
+        "writethumbnail": True,
+        "postprocessors": [],
+        "retries": 5,
+        "socket_timeout": 30,
+        "http_headers": {"User-Agent": CHROME_UA},
     }
-    if cookie_file:
+    if cookie_file and os.path.exists(cookie_file):
         opts["cookiefile"] = cookie_file
     if hook:
         opts["progress_hooks"] = [hook]
     return opts
-
-
-def _yt_opts_tv(out_dir: str, fmt: str, cookie_file: Optional[str], hook) -> dict:
-    """
-    Strategy 2: TV embedded client — another bypass method.
-    """
-    opts = _base_opts(out_dir, fmt, [])
-    opts["extractor_args"] = {
-        "youtube": {
-            "player_client": ["tv_embedded"],
-            "player_skip": ["webpage"],
-        }
-    }
-    if cookie_file:
-        opts["cookiefile"] = cookie_file
-    if hook:
-        opts["progress_hooks"] = [hook]
-    return opts
-
-
-def _yt_opts_web(out_dir: str, fmt: str, cookie_file: Optional[str], hook) -> dict:
-    """
-    Strategy 3: Web client with cookies — needs valid cookies.
-    """
-    opts = _base_opts(out_dir, fmt, [])
-    opts["extractor_args"] = {
-        "youtube": {
-            "player_client": ["web"],
-        }
-    }
-    if cookie_file:
-        opts["cookiefile"] = cookie_file
-    if hook:
-        opts["progress_hooks"] = [hook]
-    return opts
-
-
-def _generic_opts(out_dir: str, hook) -> dict:
-    """For non-YouTube platforms."""
-    opts = _base_opts(out_dir, "best[ext=mp4]/best", [])
-    if hook:
-        opts["progress_hooks"] = [hook]
-    return opts
-
-
-def _get_quality_fmt(quality: str) -> str:
-    q_map = {
-        "144p":  "bestvideo[height<=144]+bestaudio/best[height<=144]/best",
-        "360p":  "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
-        "720p":  "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-        "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-        "audio": "bestaudio/best",
-        "best":  "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-    }
-    return q_map.get(quality, q_map["best"])
 
 
 # ─────────────────────────────────────────
-#  File finder
+#  File finder — same logic as reference code
 # ─────────────────────────────────────────
 
 def _find_output_file(out_dir: str, info: dict, ydl) -> Optional[str]:
     if not info:
         return None
+    # Try ydl prepared filename first
     try:
-        f = ydl.prepare_filename(info)
-        for candidate in [f, f.replace(".webm",".mp4"), f.replace(".mkv",".mp4"), f.replace(".opus",".mp3")]:
+        filename = ydl.prepare_filename(info)
+        if os.path.exists(filename) and os.path.getsize(filename) > 1000:
+            return filename
+        # Try alternate extensions — same as reference code
+        base, _ = os.path.splitext(filename)
+        for ext in ["mp4", "mkv", "webm", "mov", "mp3", "m4a"]:
+            candidate = f"{base}.{ext}"
             if os.path.exists(candidate) and os.path.getsize(candidate) > 1000:
                 return candidate
     except Exception:
         pass
+
     # Fallback: newest real file in dir
     try:
-        skip = {".jpg",".jpeg",".png",".webp",".part",".ytdl",".tmp"}
+        skip = {".jpg", ".jpeg", ".png", ".webp", ".part", ".ytdl", ".tmp"}
         files = [
             os.path.join(out_dir, x) for x in os.listdir(out_dir)
             if os.path.isfile(os.path.join(out_dir, x))
@@ -250,7 +240,31 @@ def _find_output_file(out_dir: str, info: dict, ydl) -> Optional[str]:
 
 
 # ─────────────────────────────────────────
-#  Main download — multi-strategy for YouTube
+#  Thumbnail download — same as reference code
+# ─────────────────────────────────────────
+
+def download_thumb_from_url(thumb_url: str, video_id: str) -> Optional[str]:
+    """Download original thumbnail from URL — reference code method."""
+    if not thumb_url:
+        return None
+    thumb_path = f"/tmp/thumb_{video_id}.jpg"
+    try:
+        resp = requests.get(
+            thumb_url,
+            headers={"User-Agent": CHROME_UA},
+            timeout=10
+        )
+        if resp.status_code == 200 and len(resp.content) > 500:
+            with open(thumb_path, "wb") as f:
+                f.write(resp.content)
+            return thumb_path
+    except Exception:
+        pass
+    return None
+
+
+# ─────────────────────────────────────────
+#  Main download function
 # ─────────────────────────────────────────
 
 async def download_with_ytdlp(
@@ -261,23 +275,21 @@ async def download_with_ytdlp(
     progress_hook: Optional[Callable] = None,
 ) -> tuple:
     import yt_dlp
-    from config import YT_COOKIES, INSTAGRAM_COOKIES, TERABOX_COOKIES
+    from config import YT_COOKIES, INSTAGRAM_COOKIES, TERABOX_COOKIES, YT_PROXY
 
     url_type = detect_url_type(url)
     os.makedirs(out_dir, exist_ok=True)
     loop = asyncio.get_event_loop()
 
-    # ── Non-YouTube platforms ──
-    if url_type not in ("youtube",):
+    # ── Non-YouTube ──
+    if url_type != "youtube":
         cookie_file = None
         if url_type == "instagram" and INSTAGRAM_COOKIES:
             cookie_file = _write_cookie_file(INSTAGRAM_COOKIES, "ig")
         elif url_type == "terabox" and TERABOX_COOKIES:
             cookie_file = _write_cookie_file(TERABOX_COOKIES, "tb")
 
-        opts = _generic_opts(out_dir, progress_hook)
-        if cookie_file:
-            opts["cookiefile"] = cookie_file
+        opts = _generic_opts(out_dir, cookie_file, progress_hook)
 
         def _run_generic():
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -285,13 +297,17 @@ async def download_with_ytdlp(
                 if not info:
                     return None, None
                 if "entries" in info:
-                    results = [_find_output_file(out_dir, e, ydl) for e in (info.get("entries") or []) if e]
-                    return [r for r in results if r], info
+                    results = []
+                    for e in (info.get("entries") or []):
+                        if e:
+                            f = _find_output_file(out_dir, e, ydl)
+                            if f:
+                                results.append(f)
+                    return results or None, info
                 return _find_output_file(out_dir, info, ydl), info
 
         try:
-            result, meta = await loop.run_in_executor(None, _run_generic)
-            return result, meta
+            return await loop.run_in_executor(None, _run_generic)
         except Exception as e:
             raise RuntimeError(f"Download failed: {str(e)[:200]}")
         finally:
@@ -299,72 +315,126 @@ async def download_with_ytdlp(
                 try: os.remove(cookie_file)
                 except: pass
 
-    # ── YouTube — try multiple strategies ──
-    fmt = "bestaudio/best" if audio_only else _get_quality_fmt(quality)
+    # ── YouTube — exact method from working reference ──
+    cookie_file = _write_cookie_file(YT_COOKIES, "yt") if YT_COOKIES else None
+    opts = _yt_opts(out_dir, quality, audio_only, cookie_file, progress_hook, YT_PROXY)
 
-    # Get cookie file if available
-    cookie_file = None
-    if YT_COOKIES:
-        cookie_file = _write_cookie_file(YT_COOKIES, "yt")
+    def _run_yt():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            # Step 1: extract info only (check duration, get metadata)
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                raise RuntimeError("Could not extract video info.")
 
-    # Define strategies in order of preference
-    strategies = [
-        ("android client",     _yt_opts_android(out_dir, fmt, cookie_file, progress_hook)),
-        ("tv_embedded client", _yt_opts_tv(out_dir, fmt, cookie_file, progress_hook)),
-        ("web + cookies",      _yt_opts_web(out_dir, fmt, cookie_file, progress_hook)),
-        ("best fallback",      {**_base_opts(out_dir, "best", []), **({"cookiefile": cookie_file} if cookie_file else {})}),
-    ]
+            # Step 2: download
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                return None, None
+
+            if "entries" in info:
+                results = []
+                for e in (info.get("entries") or []):
+                    if e:
+                        f = _find_output_file(out_dir, e, ydl)
+                        if f:
+                            results.append(f)
+                return results or None, info
+
+            return _find_output_file(out_dir, info, ydl), info
 
     last_error = ""
-    for strategy_name, opts in strategies:
-        def _make_runner(o):
-            def _run():
-                with yt_dlp.YoutubeDL(o) as ydl:
+    try:
+        result, meta = await loop.run_in_executor(None, _run_yt)
+        if result:
+            return result, meta
+        raise RuntimeError("File not found after download.")
+
+    except Exception as e:
+        last_error = str(e)
+
+        # Retry with absolute fallback format if format error
+        if "format" in last_error.lower() or "Postprocessing" in last_error:
+            fallback = dict(opts)
+            fallback["format"] = "best"
+            fallback["postprocessors"] = []
+            fallback.pop("progress_hooks", None)
+
+            def _run_fallback():
+                with yt_dlp.YoutubeDL(fallback) as ydl:
                     info = ydl.extract_info(url, download=True)
-                    if not info:
-                        return None, None
-                    if "entries" in info:
-                        results = [_find_output_file(out_dir, e, ydl) for e in (info.get("entries") or []) if e]
-                        return [r for r in results if r], info
-                    return _find_output_file(out_dir, info, ydl), info
-            return _run
+                    return _find_output_file(out_dir, info, ydl) if info else None, info
 
-        try:
-            result, meta = await loop.run_in_executor(None, _make_runner(opts))
-            if result:
-                return result, meta
-        except Exception as e:
-            last_error = str(e)
-            # Only continue to next strategy on bot-detection / format errors
-            if any(x in last_error for x in [
-                "Sign in", "bot", "cookies", "LOGIN_REQUIRED",
-                "format is not available", "Postprocessing"
-            ]):
-                continue
-            # Other errors (network, etc.) — still try next
-            continue
+            try:
+                result2, meta2 = await loop.run_in_executor(None, _run_fallback)
+                if result2:
+                    return result2, meta2
+            except Exception as e2:
+                last_error = str(e2)
 
-    # All strategies failed
-    if cookie_file and os.path.exists(cookie_file):
-        try: os.remove(cookie_file)
-        except: pass
+        # Friendly error messages
+        if any(x in last_error for x in ["Sign in", "bot", "LOGIN_REQUIRED", "cookies"]):
+            raise RuntimeError(
+                "🍪 **YouTube requires cookies.**\n\n"
+                "▸ Export cookies with **Get cookies.txt LOCALLY** browser extension\n"
+                "▸ Set `YT_COOKIES` in Render Environment vars\n"
+                "▸ Use `/cookies` to verify"
+            )
+        raise RuntimeError(f"YouTube download failed: {last_error[:250]}")
 
-    if "Sign in" in last_error or "bot" in last_error.lower() or "LOGIN_REQUIRED" in last_error:
-        raise RuntimeError(
-            "🍪 **YouTube bot detection triggered.**\n\n"
-            "▸ Proxy is set ✅\n"
-            "▸ But YouTube still requires cookies from a logged-in browser.\n\n"
-            "**Fix:** Export cookies using **Get cookies.txt LOCALLY** extension\n"
-            "→ Set `YT_COOKIES` env var on Render\n"
-            "→ Use `/cookies` command to verify"
-        )
+    finally:
+        if cookie_file and os.path.exists(cookie_file):
+            try: os.remove(cookie_file)
+            except: pass
 
-    raise RuntimeError(
-        f"❌ All download strategies failed.\n\n"
-        f"Last error: `{last_error[:200]}`\n\n"
-        f"▸ Try `/formats [url]` to check availability\n"
-        f"▸ Make sure `YT_PROXY` and `YT_COOKIES` are both set"
-    )
+
+# ─────────────────────────────────────────
+#  Google Drive folder handler
+# ─────────────────────────────────────────
+
+async def download_gdrive_folder(
+    url: str,
+    out_dir: str,
+    as_zip: bool = True,
+    progress_hook: Optional[Callable] = None,
+) -> tuple:
+    """
+    Download Google Drive folder contents.
+    Returns (zip_path, meta) if as_zip=True
+    Returns (list_of_files, meta) if as_zip=False
+    """
+    import yt_dlp
+    os.makedirs(out_dir, exist_ok=True)
+    loop = asyncio.get_event_loop()
+
+    opts = {
+        "format": "best",
+        "outtmpl": os.path.join(out_dir, "%(title).80s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": False,
+        "retries": 5,
+        "http_headers": {"User-Agent": CHROME_UA},
+    }
+    if progress_hook:
+        opts["progress_hooks"] = [progress_hook]
+
+    def _run():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                return [], info
+
+            skip = {".part", ".ytdl", ".tmp"}
+            files = [
+                os.path.join(out_dir, x) for x in os.listdir(out_dir)
+                if os.path.isfile(os.path.join(out_dir, x))
+                and not any(x.endswith(e) for e in skip)
+                and os.path.getsize(os.path.join(out_dir, x)) > 0
+            ]
+            return sorted(files, key=os.path.getmtime), info
+
+    files, meta = await loop.run_in_executor(None, _run)
+    return files, meta
 
 
 # ─────────────────────────────────────────
@@ -431,20 +501,19 @@ async def generate_thumbnail(video_path: str) -> Optional[str]:
         duration = 0
         try:
             r = subprocess.run(
-                ["ffprobe","-v","quiet","-print_format","json","-show_format", video_path],
+                ["ffprobe","-v","quiet","-print_format","json","-show_format",video_path],
                 capture_output=True, text=True
             )
-            duration = float(json.loads(r.stdout).get("format",{}).get("duration", 0))
+            duration = float(json.loads(r.stdout).get("format",{}).get("duration",0))
         except Exception:
             pass
-        seek_points = [int(duration*p) for p in [0.1,0.2,0.3,0.5] if duration > 5] + [5, 3, 1, 0]
-        for seek in seek_points:
+        for seek in ([int(duration*p) for p in [0.1,0.2,0.3,0.5] if duration>5] + [5,3,1,0]):
             r = subprocess.run(
                 ["ffmpeg","-y","-ss",str(seek),"-i",video_path,
-                 "-vframes","1","-vf","scale=320:-1","-q:v","3", thumb_path],
+                 "-vframes","1","-vf","scale=320:-1","-q:v","3",thumb_path],
                 capture_output=True
             )
-            if r.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 3000:
+            if r.returncode==0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path)>3000:
                 return thumb_path
         return None
     return await loop.run_in_executor(None, _run)
@@ -456,7 +525,7 @@ async def remux_to_mp4(input_path: str) -> str:
     loop = asyncio.get_event_loop()
     def _run():
         r = subprocess.run(cmd, capture_output=True)
-        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1000:
+        if r.returncode==0 and os.path.exists(out) and os.path.getsize(out)>1000:
             try: os.remove(input_path)
             except: pass
             return out
@@ -468,18 +537,18 @@ def get_video_info(path: str) -> dict:
     try:
         r = subprocess.run(
             ["ffprobe","-v","quiet","-print_format","json",
-             "-show_streams","-show_format","-select_streams","v:0", path],
+             "-show_streams","-show_format","-select_streams","v:0",path],
             capture_output=True, text=True
         )
         data = json.loads(r.stdout)
         stream = (data.get("streams") or [{}])[0]
-        duration = float(data.get("format",{}).get("duration", 0))
-        return {"width": stream.get("width",0), "height": stream.get("height",0), "duration": int(duration)}
+        duration = float(data.get("format",{}).get("duration",0))
+        return {"width":stream.get("width",0),"height":stream.get("height",0),"duration":int(duration)}
     except Exception:
-        return {"width": 0, "height": 0, "duration": 0}
+        return {"width":0,"height":0,"duration":0}
 
 
-async def zip_folder(folder_path: str, out_path: str, name: str = "playlist") -> str:
+async def zip_folder(folder_path: str, out_path: str, name: str = "files") -> str:
     zip_path = os.path.join(out_path, f"{clean_filename(name)}.zip")
     loop = asyncio.get_event_loop()
     def _zip():
