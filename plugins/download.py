@@ -12,9 +12,9 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.errors import FloodWait
 import database as db
 from utils.decorators import not_banned, ensure_registered
-from utils.helpers import is_valid_url, detect_url_type, BULLET, DIVIDER, HEADER, FOOTER
+from utils.helpers import is_valid_url, detect_url_type, BULLET
 from queue_manager import queue_manager, DownloadJob
-from downloader.media import process_download
+from downloader.media import process_download, handle_gdrive_choice
 from config import PLANS, OWNER_IDS
 import config as _cfg
 
@@ -29,15 +29,14 @@ _CMDS = [
 
 
 async def _guard(message: Message, user_id: int) -> bool:
-    # Bot lock check
     if getattr(_cfg, "BOT_LOCK", False) and user_id not in OWNER_IDS:
-        await message.reply_text("🔒 **Bot is currently locked by the owner.** Try again later.")
+        await message.reply_text("🔒 **Bot is currently locked.** Try again later.")
         return False
     await db.check_and_reset_daily(user_id)
     await db.check_plan_expiry(user_id)
     user = await db.get_user(user_id)
     if not user:
-        await message.reply_text("❌ Not registered. Please /start first.")
+        await message.reply_text("❌ Please /start first.")
         return False
     if user.get("is_banned"):
         await message.reply_text("🚫 You are banned. Contact @TechnicalSerena.")
@@ -46,14 +45,11 @@ async def _guard(message: Message, user_id: int) -> bool:
         return True
     plan = user.get("plan","free")
     limit = PLANS.get(plan, PLANS["free"])["limit"]
-    used = user.get("daily_count", 0)
-    if used >= limit:
-        plan_name = PLANS.get(plan, PLANS["free"])["name"]
+    if user.get("daily_count", 0) >= limit:
         await message.reply_text(
             f"⚠️ **Daily limit reached!**\n\n"
-            f"{BULLET} Plan: `{plan_name}`\n"
-            f"{BULLET} Limit: `{limit}` downloads/day\n\n"
-            f"Upgrade or try again tomorrow!\n{BULLET} @TechnicalSerena"
+            f"{BULLET} Limit: `{limit}` downloads/day\n"
+            f"{BULLET} Upgrade: @TechnicalSerena"
         )
         return False
     return True
@@ -61,19 +57,19 @@ async def _guard(message: Message, user_id: int) -> bool:
 
 def _quality_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("144p",      callback_data="dl_q:144p"),
-         InlineKeyboardButton("360p",      callback_data="dl_q:360p"),
-         InlineKeyboardButton("720p",      callback_data="dl_q:720p")],
-        [InlineKeyboardButton("1080p",     callback_data="dl_q:1080p"),
-         InlineKeyboardButton("🎵 Audio",  callback_data="dl_q:audio"),
-         InlineKeyboardButton("✨ Best",   callback_data="dl_q:best")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="dl_q:cancel")],
+        [InlineKeyboardButton("144p",     callback_data="dl_q:144p"),
+         InlineKeyboardButton("360p",     callback_data="dl_q:360p"),
+         InlineKeyboardButton("720p",     callback_data="dl_q:720p")],
+        [InlineKeyboardButton("1080p",    callback_data="dl_q:1080p"),
+         InlineKeyboardButton("🎵 Audio", callback_data="dl_q:audio"),
+         InlineKeyboardButton("✨ Best",  callback_data="dl_q:best")],
+        [InlineKeyboardButton("❌ Cancel",callback_data="dl_q:cancel")],
     ])
 
 
-async def _try_pin(client: Client, chat_id: int, msg_id: int):
-    """Pin message silently in group/channel."""
+async def _try_pin(client, chat_id, msg_id):
     try:
+        from pyrogram.enums import ChatType
         await client.pin_chat_message(chat_id, msg_id, disable_notification=True)
     except Exception:
         pass
@@ -103,12 +99,80 @@ async def handle_url(client: Client, message: Message):
     }
     label = labels.get(url_type, "Media 🌐")
     short = text[:55] + "..." if len(text) > 55 else text
+
+    # Google Drive folder — show ZIP/individual choice immediately
+    if url_type == "gdrive" and "/drive/folders/" in text:
+        sm = await message.reply_text(
+            f"📁 **{label} detected!**\n\n{BULLET} `{short}`\n\n"
+            f"**How to receive files?**",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📦 ZIP Archive",      callback_data="dl_gdrive:zip"),
+                 InlineKeyboardButton("📂 Individual Files", callback_data="dl_gdrive:individual")],
+                [InlineKeyboardButton("❌ Cancel",           callback_data="dl_gdrive:cancel")],
+            ])
+        )
+        return
+
     await message.reply_text(
         f"🔍 **{label} detected!**\n\n{BULLET} `{short}`\n\n⚡ Select quality:",
         reply_markup=_quality_kb()
     )
 
 
+# ── Google Drive folder callback ──
+@Client.on_callback_query(filters.regex(r"^dl_gdrive:"))
+async def gdrive_choice_cb(client: Client, query: CallbackQuery):
+    await query.answer()
+    choice = query.data.split(":",1)[1]
+    user_id = query.from_user.id
+
+    if choice == "cancel":
+        _pending_urls.pop(user_id, None)
+        try: await query.message.edit_text("❌ Cancelled.")
+        except: pass
+        return
+
+    url = _pending_urls.pop(user_id, None)
+    if not url:
+        try: await query.message.edit_text("⚠️ Session expired. Resend the URL.")
+        except: pass
+        return
+
+    if not await _guard(query.message, user_id):
+        return
+
+    try:
+        status_msg = await query.message.edit_text(
+            f"⏳ **Queuing Google Drive download...**\n{BULLET} Mode: `{choice}`"
+        )
+    except Exception:
+        status_msg = await query.message.reply_text("⏳ Queuing...")
+
+    _sm = status_msg
+    _url = url
+    _choice = choice
+
+    job = DownloadJob(user_id=user_id, url=url, quality="best", msg_id=status_msg.id)
+
+    async def handler(j: DownloadJob):
+        await process_download(
+            client=client, message=query.message,
+            url=j.url, quality="best",
+            status_msg=_sm
+        )
+
+    pos = await queue_manager.enqueue(job, handler)
+    try:
+        await status_msg.edit_text(
+            f"📋 **Queued!**\n\n"
+            f"{BULLET} Position: `#{pos}`\n"
+            f"{BULLET} Mode: `{'ZIP Archive' if choice == 'zip' else 'Individual Files'}`"
+        )
+    except Exception:
+        pass
+
+
+# ── Quality callback ──
 @Client.on_callback_query(filters.regex(r"^dl_q:"))
 async def quality_cb(client: Client, query: CallbackQuery):
     await query.answer()
@@ -123,7 +187,7 @@ async def quality_cb(client: Client, query: CallbackQuery):
 
     url = _pending_urls.pop(user_id, None)
     if not url:
-        try: await query.message.edit_text("⚠️ Session expired. Please resend the URL.")
+        try: await query.message.edit_text("⚠️ Session expired. Resend the URL.")
         except: pass
         return
 
@@ -141,18 +205,20 @@ async def quality_cb(client: Client, query: CallbackQuery):
     job = DownloadJob(user_id=user_id, url=url, quality=quality,
                      audio_only=audio_only, msg_id=status_msg.id)
     _sm = status_msg
-    _orig_msg = query.message
+    _orig = query.message
 
     async def handler(j: DownloadJob):
         await process_download(
-            client=client, message=_orig_msg,
+            client=client, message=_orig,
             url=j.url, quality=j.quality,
             audio_only=j.audio_only, status_msg=_sm
         )
-        # Pin sent message in groups
-        from pyrogram.enums import ChatType
-        if _orig_msg.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-            await _try_pin(client, _orig_msg.chat.id, _orig_msg.id)
+        try:
+            from pyrogram.enums import ChatType
+            if _orig.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+                await _try_pin(client, _orig.chat.id, _orig.id)
+        except Exception:
+            pass
 
     pos = await queue_manager.enqueue(job, handler)
     try:
@@ -164,6 +230,13 @@ async def quality_cb(client: Client, query: CallbackQuery):
         )
     except Exception:
         pass
+
+
+# ── Google Drive ZIP/Individual callback (from media.py pending) ──
+@Client.on_callback_query(filters.regex(r"^gdrive_(zip|individual)$"))
+async def gdrive_receive_cb(client: Client, query: CallbackQuery):
+    choice = "zip" if "zip" in query.data else "individual"
+    await handle_gdrive_choice(client, query, choice)
 
 
 @Client.on_message(filters.command("audio") & ~filters.outgoing)
@@ -204,23 +277,23 @@ async def info_cmd(client: Client, message: Message):
                 return ydl.extract_info(url, download=False)
         info = await loop.run_in_executor(None, _extract)
         if not info:
-            await msg.edit_text("❌ Could not fetch media info.")
+            await msg.edit_text("❌ Could not fetch info.")
             return
         from utils.helpers import fmt_duration, fmt_size
         title    = info.get("title","Unknown")[:60]
-        duration = info.get("duration", 0)
+        duration = info.get("duration",0)
         uploader = info.get("uploader","Unknown")
-        views    = info.get("view_count", 0)
-        likes    = info.get("like_count", 0)
+        views    = info.get("view_count",0)
+        likes    = info.get("like_count",0)
         ext      = info.get("ext","?")
         await msg.edit_text(
-            f"{HEADER}\n**Media Info** ℹ️\n{DIVIDER}\n\n"
+            f"⋆｡° ✮ °｡⋆\n**Media Info** ℹ️\n»»──── ✦ ────««\n\n"
             f"{BULLET} **Title:** `{title}`\n"
             f"{BULLET} **Duration:** `{fmt_duration(int(duration)) if duration else 'N/A'}`\n"
             f"{BULLET} **Uploader:** `{uploader}`\n"
             f"{BULLET} **Views:** `{views:,}`\n"
             f"{BULLET} **Likes:** `{likes:,}`\n"
-            f"{BULLET} **Format:** `{ext}`\n\n{FOOTER}",
+            f"{BULLET} **Format:** `{ext}`\n\n⋆ ｡˚ ˚｡ ⋆",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("⬇️ Download", callback_data=f"info_dl:{url[:80]}")
             ]])
