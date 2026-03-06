@@ -1,14 +1,8 @@
 """
-╔══════════════════════════════════════════╗
-║     Serena Downloader Bot - Admin        ║
-╚══════════════════════════════════════════╝
+Serena Downloader Bot - Admin Commands
 """
+import os, sys, asyncio
 
-import os
-import sys
-import asyncio
-
-# ── sys.path fix — required for Pyrogram plugin loader ──
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
     sys.path.insert(0, _root)
@@ -20,60 +14,33 @@ import database as db
 from utils.decorators import owner_only, ensure_registered
 from utils.helpers import BULLET, DIVIDER, HEADER, FOOTER
 from config import PLANS, OWNER_IDS
-
-
-def parse_target(message: Message):
-    args = message.command[1:]
-    if not args:
-        return None
-    target = args[0].lstrip("@")
-    if target.isdigit():
-        return int(target)
-    return target
+import config as _cfg
 
 
 @Client.on_message(filters.command("givepremium") & ~filters.outgoing)
 @owner_only
 async def givepremium_cmd(client: Client, message: Message):
-    """Usage: /givepremium <user_id> <basic|premium>"""
     args = message.command[1:]
     if len(args) < 2:
-        await message.reply_text(
-            "Usage: `/givepremium <user_id> <basic|premium>`\n"
-            "Example: `/givepremium 123456789 premium`"
-        )
+        await message.reply_text("Usage: `/givepremium <user_id> <basic|premium>`")
         return
-
-    target = args[0].lstrip("@")
+    if not args[0].lstrip("@").isdigit():
+        await message.reply_text("❌ Numeric user ID required.")
+        return
+    user_id = int(args[0].lstrip("@"))
     plan = args[1].lower()
-
-    if plan not in ("basic", "premium"):
+    if plan not in ("basic","premium"):
         await message.reply_text("❌ Plan must be `basic` or `premium`.")
         return
-
-    if not target.isdigit():
-        await message.reply_text("❌ Please provide a numeric user ID.")
-        return
-
-    user_id = int(target)
     await db.ensure_user(user_id)
     days = PLANS[plan]["days"]
     await db.set_plan(user_id, plan, days)
-
     await message.reply_text(
-        f"✅ **Plan Updated!**\n\n"
-        f"{BULLET} User: `{user_id}`\n"
-        f"{BULLET} Plan: `{PLANS[plan]['name']}`\n"
-        f"{BULLET} Duration: `{days} days`"
+        f"✅ **Plan Updated!**\n{BULLET} User: `{user_id}`\n{BULLET} Plan: `{PLANS[plan]['name']}`\n{BULLET} Duration: `{days}d`"
     )
     try:
-        await client.send_message(
-            user_id,
-            f"🎉 **Your plan has been upgraded!**\n\n"
-            f"{BULLET} New Plan: `{PLANS[plan]['name']}`\n"
-            f"{BULLET} Duration: `{days} days`\n\n"
-            f"Enjoy your premium access! 💎"
-        )
+        await client.send_message(user_id,
+            f"🎉 **Plan upgraded to {PLANS[plan]['name']}!**\n{BULLET} Duration: `{days} days`\nEnjoy! 💎")
     except Exception:
         pass
 
@@ -87,13 +54,9 @@ async def removepremium_cmd(client: Client, message: Message):
         return
     user_id = int(args[0].lstrip("@"))
     await db.set_plan(user_id, "free", 0)
-    await message.reply_text(f"✅ User `{user_id}` reverted to Free plan.")
+    await message.reply_text(f"✅ User `{user_id}` reverted to **Free**.")
     try:
-        await client.send_message(
-            user_id,
-            "ℹ️ Your plan has been reverted to **Free 🆓**.\n"
-            "Contact @TechnicalSerena for more info."
-        )
+        await client.send_message(user_id, "ℹ️ Your plan has been reverted to **Free 🆓**.")
     except Exception:
         pass
 
@@ -108,9 +71,9 @@ async def ban_cmd(client: Client, message: Message):
     user_id = int(args[0].lstrip("@"))
     await db.ensure_user(user_id)
     await db.ban_user(user_id)
-    await message.reply_text(f"🚫 User `{user_id}` has been **banned**.")
+    await message.reply_text(f"🚫 User `{user_id}` **banned**.")
     try:
-        await client.send_message(user_id, "🚫 You have been banned from using this bot.")
+        await client.send_message(user_id, "🚫 You have been banned. Contact @TechnicalSerena.")
     except Exception:
         pass
 
@@ -124,7 +87,7 @@ async def unban_cmd(client: Client, message: Message):
         return
     user_id = int(args[0].lstrip("@"))
     await db.unban_user(user_id)
-    await message.reply_text(f"✅ User `{user_id}` has been **unbanned**.")
+    await message.reply_text(f"✅ User `{user_id}` **unbanned**.")
     try:
         await client.send_message(user_id, "✅ You have been unbanned! Welcome back.")
     except Exception:
@@ -138,19 +101,13 @@ async def broadcast_cmd(client: Client, message: Message):
     if not text:
         await message.reply_text("Usage: `/broadcast <message>`")
         return
-
     users = await db.get_all_users()
-    status_msg = await message.reply_text(f"📢 Broadcasting to `{len(users)}` users...")
-
-    sent = 0
-    failed = 0
+    msg = await message.reply_text(f"📢 Broadcasting to `{len(users)}` users...")
+    sent = failed = 0
     for user in users:
         for attempt in range(2):
             try:
-                await client.send_message(
-                    user["user_id"],
-                    f"📢 **Broadcast Message**\n\n{text}"
-                )
+                await client.send_message(user["user_id"], f"📢 **Broadcast**\n\n{text}")
                 sent += 1
                 await asyncio.sleep(0.08)
                 break
@@ -159,28 +116,21 @@ async def broadcast_cmd(client: Client, message: Message):
             except Exception:
                 failed += 1
                 break
-
-    await status_msg.edit_text(
-        f"✅ **Broadcast Complete!**\n\n"
-        f"{BULLET} Sent: `{sent}`\n"
-        f"{BULLET} Failed: `{failed}`"
-    )
+    await msg.edit_text(f"✅ **Broadcast done!**\n{BULLET} Sent: `{sent}`\n{BULLET} Failed: `{failed}`")
 
 
 @Client.on_message(filters.command("stats") & ~filters.outgoing)
 @owner_only
 async def stats_cmd(client: Client, message: Message):
     stats = await db.get_stats()
-    plans = stats.get("plans", {})
-    plan_lines = "\n".join(f"{BULLET} `{k}`: `{v}`" for k, v in plans.items())
+    plans_text = "\n".join(f"{BULLET} `{k}`: `{v}`" for k,v in stats.get("plans",{}).items())
     await message.reply_text(
         f"{HEADER}\n**Bot Statistics** 📊\n{DIVIDER}\n\n"
         f"{BULLET} Total Users: `{stats['total_users']}`\n"
         f"{BULLET} Banned: `{stats['banned']}`\n"
         f"{BULLET} Total Downloads: `{stats['total_downloads']}`\n"
         f"{BULLET} Successful: `{stats['successful_downloads']}`\n\n"
-        f"**Plans:**\n{plan_lines}\n\n"
-        f"{FOOTER}"
+        f"**Plans:**\n{plans_text}\n\n{FOOTER}"
     )
 
 
@@ -188,15 +138,12 @@ async def stats_cmd(client: Client, message: Message):
 @owner_only
 async def users_cmd(client: Client, message: Message):
     users = await db.get_all_users()
-    lines = [f"{HEADER}\n**All Users** 👥\n{DIVIDER}\n"]
+    lines = [f"**Users** 👥 (`{len(users)}` total)\n{DIVIDER}\n"]
     for u in users[:30]:
-        uid = u["user_id"]
         uname = f"@{u['username']}" if u.get("username") else "N/A"
-        plan = u.get("plan", "free")
-        lines.append(f"`{uid}` · {uname} · `{plan}`")
+        lines.append(f"`{u['user_id']}` · {uname} · `{u.get('plan','free')}`")
     if len(users) > 30:
-        lines.append(f"\n... and `{len(users) - 30}` more.")
-    lines.append(f"\n{FOOTER}")
+        lines.append(f"\n...and `{len(users)-30}` more.")
     await message.reply_text("\n".join(lines))
 
 
@@ -207,17 +154,32 @@ async def banned_cmd(client: Client, message: Message):
     if not banned:
         await message.reply_text("✅ No banned users.")
         return
-    lines = [f"**Banned Users** 🚫\n{DIVIDER}\n"]
+    lines = [f"**Banned Users** 🚫\n"]
     for u in banned:
-        uid = u["user_id"]
         uname = f"@{u['username']}" if u.get("username") else "N/A"
-        lines.append(f"`{uid}` · {uname}")
+        lines.append(f"`{u['user_id']}` · {uname}")
     await message.reply_text("\n".join(lines))
+
+
+@Client.on_message(filters.command("lock") & ~filters.outgoing)
+@owner_only
+async def lock_cmd(client: Client, message: Message):
+    """Lock bot — non-owners cannot download."""
+    _cfg.BOT_LOCK = True
+    await message.reply_text("🔒 **Bot locked!** Only owner can use downloads.")
+
+
+@Client.on_message(filters.command("unlock") & ~filters.outgoing)
+@owner_only
+async def unlock_cmd(client: Client, message: Message):
+    """Unlock bot — all users can download again."""
+    _cfg.BOT_LOCK = False
+    await message.reply_text("🔓 **Bot unlocked!** All users can download.")
 
 
 @Client.on_message(filters.command("restart") & ~filters.outgoing)
 @owner_only
 async def restart_cmd(client: Client, message: Message):
-    await message.reply_text("🔄 **Restarting bot...** Be right back!")
+    await message.reply_text("🔄 **Restarting...** Be right back!")
     await asyncio.sleep(1)
     os.execv(sys.executable, [sys.executable, os.path.abspath("bot.py")])
