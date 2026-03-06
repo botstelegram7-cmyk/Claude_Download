@@ -1,6 +1,6 @@
 """
 Serena Downloader Bot - Reactions
-Random reactions on ALL messages in groups AND DMs
+Random reactions on messages in groups AND DMs
 """
 import os, sys, asyncio, random
 
@@ -9,12 +9,12 @@ if _root not in sys.path:
     sys.path.insert(0, _root)
 
 from pyrogram import Client, filters
-from pyrogram.types import Message, ReactionTypeEmoji
+from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 
 from config import REACTION_EMOJIS
 
-REACTION_CHANCE = 0.75  # 75% chance to react
+REACTION_CHANCE = 0.75
 
 
 @Client.on_message(
@@ -28,7 +28,6 @@ async def auto_react(client: Client, message: Message):
     if not message.from_user:
         return
 
-    # Random human-like delay 1-4 seconds
     await asyncio.sleep(random.uniform(1.0, 4.0))
 
     emoji = random.choice(REACTION_EMOJIS)
@@ -37,7 +36,7 @@ async def auto_react(client: Client, message: Message):
             await client.send_reaction(
                 chat_id=message.chat.id,
                 message_id=message.id,
-                reaction=[ReactionTypeEmoji(emoji=emoji)],
+                emoji=emoji,   # Pyrogram 2.x uses emoji= directly
             )
             return
         except FloodWait as e:
