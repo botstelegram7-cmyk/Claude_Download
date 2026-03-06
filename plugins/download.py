@@ -5,7 +5,14 @@
 """
 
 import os
+import sys
 import asyncio
+
+# ── sys.path fix — required for Pyrogram plugin loader ──
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -22,10 +29,10 @@ from config import PLANS, OWNER_IDS
 _pending_urls: dict = {}
 
 _ADMIN_CMDS = [
-    "start","help","ping","status","plans","mystats","history",
-    "settings","audio","info","queue","cancel","feedback",
-    "givepremium","removepremium","ban","unban","broadcast",
-    "stats","users","banned","restart"
+    "start", "help", "ping", "status", "plans", "mystats", "history",
+    "settings", "audio", "info", "queue", "cancel", "feedback",
+    "givepremium", "removepremium", "ban", "unban", "broadcast",
+    "stats", "users", "banned", "restart"
 ]
 
 
@@ -73,7 +80,6 @@ def _quality_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-# ─── URL message handler ───
 @Client.on_message(
     filters.text & ~filters.outgoing & ~filters.command(_ADMIN_CMDS),
     group=1
@@ -111,7 +117,6 @@ async def handle_url(client: Client, message: Message):
     )
 
 
-# ─── Quality callback ───
 @Client.on_callback_query(filters.regex(r"^dl_q:"))
 async def quality_callback(client: Client, query: CallbackQuery):
     await query.answer()
@@ -155,11 +160,8 @@ async def quality_callback(client: Client, query: CallbackQuery):
         msg_id=status_msg.id
     )
 
-    # Capture for closure
     _status = status_msg
     _url = url
-    _quality = quality
-    _audio = audio_only
 
     async def handler(j: DownloadJob):
         await process_download(
@@ -178,13 +180,12 @@ async def quality_callback(client: Client, query: CallbackQuery):
             f"📋 **Added to queue!**\n\n"
             f"{BULLET} Position: `#{pos}`\n"
             f"{BULLET} Quality: `{quality}`\n"
-            f"{BULLET} URL: `{url[:50]}...`"
+            f"{BULLET} URL: `{_url[:50]}...`"
         )
     except Exception:
         pass
 
 
-# ─── /audio command ───
 @Client.on_message(filters.command("audio") & ~filters.outgoing)
 @ensure_registered
 @not_banned
@@ -206,6 +207,7 @@ async def audio_cmd(client: Client, message: Message):
     job = DownloadJob(user_id=user_id, url=url, quality="audio", audio_only=True, msg_id=status_msg.id)
 
     _sm = status_msg
+
     async def handler(j: DownloadJob):
         await process_download(client, message, j.url, quality="audio", audio_only=True, status_msg=_sm)
 
@@ -219,7 +221,6 @@ async def audio_cmd(client: Client, message: Message):
         pass
 
 
-# ─── /info command ───
 @Client.on_message(filters.command("info") & ~filters.outgoing)
 @ensure_registered
 @not_banned
@@ -268,15 +269,12 @@ async def info_cmd(client: Client, message: Message):
             pass
 
 
-# ─── /cancel command ───
 @Client.on_message(filters.command("cancel") & ~filters.outgoing)
 async def cancel_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    _pending_urls.pop(user_id, None)
+    _pending_urls.pop(message.from_user.id, None)
     await message.reply_text("❌ **Cancelled.** Pending URL selection cleared.")
 
 
-# ─── .txt bulk handler ───
 @Client.on_message(filters.document & ~filters.outgoing, group=1)
 @ensure_registered
 @not_banned
@@ -294,7 +292,10 @@ async def handle_document(client: Client, message: Message):
     try:
         file_path = await client.download_media(message, file_name=f"/tmp/{user_id}_bulk.txt")
         with open(file_path, "r") as f:
-            lines = [l.strip() for l in f if l.strip() and not l.startswith("#") and is_valid_url(l.strip())]
+            lines = [
+                l.strip() for l in f
+                if l.strip() and not l.startswith("#") and is_valid_url(l.strip())
+            ]
         os.remove(file_path)
 
         if not lines:
@@ -312,13 +313,15 @@ async def handle_document(client: Client, message: Message):
             job = DownloadJob(user_id=user_id, url=url, quality="best", msg_id=s_msg.id)
 
             _sm = s_msg
+
             async def make_handler(_sm=_sm):
                 async def h(j: DownloadJob):
                     await process_download(client, message, j.url, status_msg=_sm)
                 return h
+
             h = await make_handler()
             await queue_manager.enqueue(job, h)
-            await asyncio.sleep(0.3)  # slight delay between queuing
+            await asyncio.sleep(0.3)
 
         await status_msg.edit_text(f"✅ **All {len(lines)} URLs queued!**")
     except Exception as e:

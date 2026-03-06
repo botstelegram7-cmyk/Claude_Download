@@ -4,11 +4,19 @@
 ╚══════════════════════════════════════════╝
 """
 
+import os
+import sys
+
+# ── sys.path fix — required for Pyrogram plugin loader ──
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import database as db
 from utils.decorators import not_banned, ensure_registered
-from utils.helpers import make_header, make_footer, BULLET, DIVIDER, HEADER, FOOTER
+from utils.helpers import BULLET, DIVIDER, HEADER, FOOTER
 from config import (
     BOT_NAME, BOT_USERNAME, OWNER_USERNAME, SUPPORT_USERNAME,
     PLANS, FREE_LIMIT, BASIC_LIMIT, PREMIUM_LIMIT
@@ -101,7 +109,6 @@ async def status_cmd(client: Client, message: Message):
     stats = await db.get_stats()
     active = queue_manager.active_count()
     queued = queue_manager.queue_size()
-
     await message.reply_text(
         f"{HEADER}\n"
         f"**Bot Status** ⚡\n"
@@ -244,6 +251,7 @@ async def feedback_cmd(client: Client, message: Message):
 
 
 # ── Callback Queries ──
+
 @Client.on_callback_query(filters.regex("^plans$"))
 async def cb_plans(client: Client, query: CallbackQuery):
     await query.answer()
