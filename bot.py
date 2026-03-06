@@ -1,11 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════╗
 ║                                                      ║
-║         ⋆｡° ✮ Serena Downloader Bot ✮ °｡⋆          ║
+║        ⋆｡° ✮ Serena Downloader Bot ✮ °｡⋆           ║
 ║                                                      ║
-║         @Universal_DownloadBot                       ║
-║         Owner: @Xioqui_Xan                           ║
-║         Support: @TechnicalSerena                    ║
+║        @Universal_DownloadBot                        ║
+║        Owner: @Xioqui_Xan                            ║
+║        Support: @TechnicalSerena                     ║
 ║                                                      ║
 ╚══════════════════════════════════════════════════════╝
 """
@@ -16,6 +16,12 @@ import os
 import sys
 import threading
 
+# ── CRITICAL: Add project root to sys.path so plugins can resolve
+#    utils.*, database, config, etc. when loaded by Pyrogram.
+_root = os.path.dirname(os.path.abspath(__file__))
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
 # ── Setup logging ──
 logging.basicConfig(
     level=logging.INFO,
@@ -24,12 +30,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SerenaBot")
 
-# ── Ensure required dirs ──
-for d in ["/tmp/serena_db", "/tmp/serena_dl"]:
-    os.makedirs(d, exist_ok=True)
+# ── Ensure runtime dirs exist ──
+for _d in ["/tmp/serena_db", "/tmp/serena_dl"]:
+    os.makedirs(_d, exist_ok=True)
 
-# ── Import config first ──
-from config import BOT_TOKEN, API_ID, API_HASH, DL_DIR, DB_PATH, PORT
+# ── Config ──
+from config import BOT_TOKEN, API_ID, API_HASH, PORT
 
 
 def validate_config():
@@ -54,19 +60,19 @@ async def main():
     await db.init_db()
     logger.info("✅ Database initialized")
 
-    # ── Import client (plugins loaded via Client plugins= param) ──
+    # ── Start Flask web server in background thread ──
+    from web.app import run_web
+    web_thread = threading.Thread(target=run_web, daemon=True, name="WebServer")
+    web_thread.start()
+    logger.info(f"✅ Web server starting on port {PORT}")
+
+    # ── Import client (Pyrogram will load plugins/ via plugins= param) ──
     from client import app
     from queue_manager import queue_manager
 
     # ── Start queue worker ──
     queue_manager.start()
     logger.info("✅ Queue manager started")
-
-    # ── Start Flask web server in background thread ──
-    from web.app import run_web
-    web_thread = threading.Thread(target=run_web, daemon=True)
-    web_thread.start()
-    logger.info(f"✅ Web server started on port {PORT}")
 
     # ── Start bot ──
     logger.info("🚀 Starting Serena Downloader Bot...")
@@ -75,17 +81,13 @@ async def main():
     me = await app.get_me()
     logger.info(
         f"\n"
-        f"╔══════════════════════════════════════╗\n"
-        f"║  ⋆｡° ✮ Serena Downloader Bot ✮ °｡⋆ ║\n"
-        f"╠══════════════════════════════════════╣\n"
-        f"║  Bot: @{me.username:<29} ║\n"
-        f"║  ID: {me.id:<31} ║\n"
-        f"║  Owner: @Xioqui_Xan                  ║\n"
-        f"║  Support: @TechnicalSerena            ║\n"
-        f"╚══════════════════════════════════════╝\n"
+        f"  ⋆｡° ✮ Serena Downloader Bot ✮ °｡⋆\n"
+        f"  Bot     : @{me.username}\n"
+        f"  ID      : {me.id}\n"
+        f"  Owner   : @Xioqui_Xan\n"
+        f"  Support : @TechnicalSerena\n"
+        f"  Status  : 🟢 Online\n"
     )
-
-    logger.info("✅ Bot is running! Press Ctrl+C to stop.")
 
     # ── Keep alive ──
     try:
