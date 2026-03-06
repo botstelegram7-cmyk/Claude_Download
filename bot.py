@@ -35,7 +35,7 @@ for _d in ["/tmp/serena_db", "/tmp/serena_dl"]:
     os.makedirs(_d, exist_ok=True)
 
 # ── Config ──
-from config import BOT_TOKEN, API_ID, API_HASH
+from config import BOT_TOKEN, API_ID, API_HASH, PORT
 
 
 def validate_config():
@@ -52,48 +52,6 @@ def validate_config():
         sys.exit(1)
 
 
-async def start_bot_with_retry(app):
-    """
-    Attempt app.start() and handle Telegram's auth FloodWait gracefully.
-    Telegram can impose a wait of up to ~40 min on auth.ImportBotAuthorization
-    if the bot was restarted/redeployed too many times in quick succession.
-    We wait the exact required time then retry automatically — no crash.
-    """
-    from pyrogram.errors import FloodWait
-
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            await app.start()
-            return  # success
-        except FloodWait as e:
-            wait_sec = e.value + 5   # add 5s buffer on top of required wait
-            wait_min = wait_sec / 60
-            logger.warning(
-                f"⏳ Telegram auth FloodWait on attempt #{attempt}. "
-                f"Required wait: {e.value}s (~{wait_min:.1f} min). "
-                f"Sleeping {wait_sec}s then retrying automatically..."
-            )
-            # Sleep in 30s chunks so logs stay active and web server stays alive
-            slept = 0
-            chunk = 30
-            while slept < wait_sec:
-                sleep_now = min(chunk, wait_sec - slept)
-                await asyncio.sleep(sleep_now)
-                slept += sleep_now
-                remaining = wait_sec - slept
-                if remaining > 0:
-                    logger.info(
-                        f"⏳ Auth flood wait: {remaining:.0f}s remaining "
-                        f"(~{remaining/60:.1f} min)..."
-                    )
-            logger.info(f"🔄 Retrying bot.start() (attempt #{attempt + 1})...")
-        except Exception as e:
-            logger.error(f"❌ Unexpected error during app.start(): {e}")
-            raise
-
-
 async def main():
     validate_config()
 
@@ -102,18 +60,13 @@ async def main():
     await db.init_db()
     logger.info("✅ Database initialized")
 
-    # ── Start Flask web server FIRST so Render health checks pass during
-    #    any FloodWait delay (Render kills the service if /health doesn't respond)
+    # ── Start Flask web server in background thread ──
     from web.app import run_web
-    port = int(os.environ.get("PORT", "10000"))
     web_thread = threading.Thread(target=run_web, daemon=True, name="WebServer")
     web_thread.start()
-    logger.info(f"✅ Web server started on port {port}")
+    logger.info(f"✅ Web server starting on port {PORT}")
 
-    # Small delay to let Flask bind before bot auth starts
-    await asyncio.sleep(2)
-
-    # ── Import client + queue ──
+    # ── Import client (Pyrogram will load plugins/ via plugins= param) ──
     from client import app
     from queue_manager import queue_manager
 
@@ -121,9 +74,9 @@ async def main():
     queue_manager.start()
     logger.info("✅ Queue manager started")
 
-    # ── Start bot — with FloodWait retry loop ──
+    # ── Start bot ──
     logger.info("🚀 Starting Serena Downloader Bot...")
-    await start_bot_with_retry(app)
+    await app.start()
 
     me = await app.get_me()
     logger.info(

@@ -4,14 +4,6 @@
 ╚══════════════════════════════════════════╝
 """
 
-import os
-import sys
-
-# ── Ensure project root is on sys.path BEFORE Pyrogram loads plugins ──
-_root = os.path.dirname(os.path.abspath(__file__))
-if _root not in sys.path:
-    sys.path.insert(0, _root)
-
 from pyrogram import Client
 from config import BOT_TOKEN, API_ID, API_HASH
 
