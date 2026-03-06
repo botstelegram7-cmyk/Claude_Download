@@ -4,15 +4,7 @@
 ╚══════════════════════════════════════════╝
 """
 
-import os
-import sys
 import functools
-
-# ── sys.path fix ──
-_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _root not in sys.path:
-    sys.path.insert(0, _root)
-
 from pyrogram.types import Message
 import database as db
 from config import OWNER_IDS
@@ -41,7 +33,7 @@ def not_banned(func):
             await message.reply_text(
                 "🚫 **You have been banned**\n\n"
                 "▸ Contact support if this is a mistake.\n"
-                "▸ Support: @TechnicalSerena"
+                f"▸ Support: @TechnicalSerena"
             )
             return
         return await func(client, message, *args, **kwargs)

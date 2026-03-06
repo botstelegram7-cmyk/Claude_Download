@@ -4,16 +4,9 @@
 ╚══════════════════════════════════════════╝
 """
 
-import os
-import sys
 import time
 import asyncio
-
-# ── sys.path fix ──
-_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _root not in sys.path:
-    sys.path.insert(0, _root)
-
+from typing import Optional
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, MessageNotModified
 
@@ -61,11 +54,11 @@ def build_progress_text(
     eta: int = 0,
     action: str = "Downloading",
 ) -> str:
-    bar       = _make_bar(pct)
-    done_str  = _fmt_size(current)
+    bar = _make_bar(pct)
+    done_str = _fmt_size(current)
     total_str = _fmt_size(total) if total else "?"
     speed_str = _fmt_speed(speed) if speed > 0 else "—"
-    eta_str   = _fmt_eta(eta)
+    eta_str = _fmt_eta(eta)
     return (
         f"➵⋆ **{action}** `{title[:40]}`\n\n"
         f"`[{bar}]`\n"
@@ -77,17 +70,16 @@ def build_progress_text(
 
 
 class ProgressTracker:
-    def __init__(self, message: Message, title: str = "Media",
-                 action: str = "Downloading", interval: float = 3.5):
-        self.message  = message
-        self.title    = title
-        self.action   = action
+    def __init__(self, message: Message, title: str = "Media", action: str = "Downloading", interval: float = 3.5):
+        self.message = message
+        self.title = title
+        self.action = action
         self.interval = interval
         self._last_update: float = 0
-        self._last_text: str    = ""
-        self._last_bytes: int   = 0
+        self._last_text: str = ""
+        self._last_bytes: int = 0
         self._last_speed_time: float = time.time()
-        self._speed: float      = 0.0
+        self._speed: float = 0.0
 
     def _calc_speed(self, current: int) -> float:
         now = time.time()
@@ -104,9 +96,9 @@ class ProgressTracker:
             return
         self._last_update = now
         speed = self._calc_speed(current)
-        pct   = min(current / total * 100, 100.0) if total > 0 else 0.0
-        eta   = int((total - current) / speed) if speed > 0 and total > 0 else 0
-        text  = build_progress_text(self.title, pct, current, total, speed, eta, self.action)
+        pct = min(current / total * 100, 100.0) if total > 0 else 0.0
+        eta = int((total - current) / speed) if speed > 0 and total > 0 else 0
+        text = build_progress_text(self.title, pct, current, total, speed, eta, self.action)
         if text == self._last_text:
             return
         self._last_text = text
@@ -133,10 +125,10 @@ class ProgressTracker:
 
 class YtdlpProgressHook:
     def __init__(self, tracker: ProgressTracker, loop: asyncio.AbstractEventLoop):
-        self.tracker   = tracker
-        self.loop      = loop
+        self.tracker = tracker
+        self.loop = loop
         self._last_call: float = 0
-        self._interval: float  = 3.5
+        self._interval: float = 3.5
 
     def __call__(self, d: dict):
         if d["status"] != "downloading":
@@ -146,17 +138,13 @@ class YtdlpProgressHook:
             return
         self._last_call = now
         current = d.get("downloaded_bytes", 0) or 0
-        total   = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-        speed   = d.get("speed") or 0
-        eta     = int(d.get("eta") or 0)
-        pct     = min(current / total * 100, 100.0) if total > 0 else 0.0
-        text    = build_progress_text(
-            self.tracker.title, pct, current, total, speed, eta, self.tracker.action
-        )
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        speed = d.get("speed") or 0
+        eta = int(d.get("eta") or 0)
+        pct = min(current / total * 100, 100.0) if total > 0 else 0.0
+        text = build_progress_text(self.tracker.title, pct, current, total, speed, eta, self.tracker.action)
         if text == self.tracker._last_text:
             return
-        self.tracker._last_text   = text
+        self.tracker._last_text = text
         self.tracker._last_update = now
-        asyncio.run_coroutine_threadsafe(
-            self.tracker._safe_edit(text), self.loop
-        )
+        asyncio.run_coroutine_threadsafe(self.tracker._safe_edit(text), self.loop)
