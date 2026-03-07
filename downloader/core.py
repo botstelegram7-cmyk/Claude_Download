@@ -1,12 +1,12 @@
 """
 Serena Bot - Core Downloader
-KEY FIXES:
-- YouTube: cookies written as actual file on disk, verified before use
-- All video: send_video with supports_streaming=True (Telegram playable)
-- Audio /audio cmd: FFmpegExtractAudio postprocessor  
-- Progress: title shown in bar
+FIXES:
+1. YouTube: yt-dlp auto-update + PO token bypass + cookies
+2. Terabox: all domains + proxy support  
+3. Instagram: best quality (bestvideo+bestaudio)
+4. All video: remux to streamable MP4
 """
-import os, sys, asyncio, subprocess, uuid, time, shutil, zipfile, json, re
+import os, sys, asyncio, subprocess, uuid, time, shutil, zipfile, json
 from typing import Optional, Callable
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,36 +23,62 @@ CHROME_UA = (
     "Chrome/133.0.0.0 Safari/537.36"
 )
 
+# All Terabox domains
+TERABOX_DOMAINS = [
+    "terabox.com", "1024terabox.com", "teraboxapp.com", "terabox.app",
+    "4funbox.com", "mirrobox.com", "nephobox.com", "freeterabox.com",
+    "momerybox.com", "tibibox.com", "teraboxlink.com", "terasharelink.com",
+]
+
+
+# ── yt-dlp auto-update (run once on startup) ──────────────────────────────
+
+_yt_dlp_updated = False
+
+async def _ensure_ytdlp_updated():
+    global _yt_dlp_updated
+    if _yt_dlp_updated:
+        return
+    _yt_dlp_updated = True
+    loop = asyncio.get_event_loop()
+    def _upd():
+        try:
+            r = subprocess.run(
+                ["pip", "install", "--upgrade", "yt-dlp", "--break-system-packages", "-q"],
+                capture_output=True, text=True, timeout=60
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+    await loop.run_in_executor(None, _upd)
+
 
 # ── Cookie helpers ─────────────────────────────────────────────────────────
 
 def _write_cookie_file(raw: str, prefix: str) -> Optional[str]:
-    """Write Netscape cookie file, fixing Render env var encoding issues."""
     if not raw or not raw.strip():
         return None
-    # Fix Render env var encoding — literal \n → real newlines
-    content = raw.strip()
-    content = content.strip('"').strip("'")
+    content = raw.strip().strip('"').strip("'")
+    # Fix Render encoding — literal \n and \t to real ones
     content = content.replace("\\n", "\n").replace("\\t", "\t")
     content = content.replace("\r\n", "\n").replace("\r", "\n")
 
-    # Validate — must have at least one tab-separated cookie line
     lines = content.split("\n")
     has_cookie = any(
         len(l.split("\t")) >= 7 and not l.startswith("#")
         for l in lines if l.strip()
     )
     if not has_cookie:
-        return None  # broken cookie content
+        return None
 
     try:
         path = f"/tmp/{prefix}_cookies_{os.getpid()}.txt"
         with open(path, "w", encoding="utf-8") as f:
             if "# Netscape" not in content:
-                f.write("# Netscape HTTP Cookie File\n")
-                f.write("# This file is generated automatically.\n\n")
+                f.write("# Netscape HTTP Cookie File\n\n")
             f.write(content)
-            f.write("\n")
+            if not content.endswith("\n"):
+                f.write("\n")
         return path
     except Exception:
         return None
@@ -67,7 +93,7 @@ async def check_yt_cookies_status() -> dict:
     path = _write_cookie_file(YT_COOKIES, "yt_check")
     if not path:
         return {"valid": False, "expired": False,
-                "message": "❌ Cookie content invalid — check for encoding issues.\nMake sure you pasted raw Netscape format, not base64."}
+                "message": "❌ Cookie content invalid — wrong format or encoding issue."}
     now = int(time.time())
     valid = expired = 0
     nearest = None
@@ -91,13 +117,12 @@ async def check_yt_cookies_status() -> dict:
         except: pass
     if valid == 0 and expired > 0:
         return {"valid": False, "expired": True,
-                "message": f"⚠️ All **{expired}** cookies **expired**!\nExport fresh cookies from Chrome."}
+                "message": f"⚠️ All **{expired}** cookies expired! Export fresh cookies."}
     if valid > 0:
         exp_str = datetime.utcfromtimestamp(nearest).strftime("%Y-%m-%d") if nearest else "session"
         return {"valid": True, "expired": False,
                 "message": f"✅ **{valid}** valid entries. Nearest expiry: `{exp_str}`"}
-    return {"valid": False, "expired": False,
-            "message": "❌ No valid cookie entries found."}
+    return {"valid": False, "expired": False, "message": "❌ No valid entries found."}
 
 
 # ── File finder ────────────────────────────────────────────────────────────
@@ -130,8 +155,11 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
     import yt_dlp
     from config import YT_COOKIES, YT_PROXY
 
+    # Try to update yt-dlp first (fixes "Failed to extract player response")
+    await _ensure_ytdlp_updated()
+
     fmt = "bestaudio/best" if audio_only else {
-        "144p": "worst[height>=144]/best[height<=144]/worst",
+        "144p": "best[height<=144]/worst",
         "360p": "best[height<=360]/best",
         "720p": "best[height<=720]/best",
         "1080p": "best[height<=1080]/best",
@@ -174,7 +202,7 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
         {"player_client": ["tv_embedded"]},
         {"player_client": ["ios"], "player_skip": ["webpage", "configs"]},
         {"player_client": ["mweb"]},
-        {},  # default web
+        {},
     ]
 
     loop = asyncio.get_event_loop()
@@ -206,26 +234,87 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
         try: os.remove(cookie_file)
         except: pass
 
-    # Give user a clear actionable error
     raise RuntimeError(
-        "🔐 **YouTube blocked this server.**\n\n"
-        "**Solution — set fresh cookies:**\n"
-        "`1.` Open Chrome → youtube.com → Login\n"
-        "`2.` Install `Get cookies.txt LOCALLY` extension\n"
-        "`3.` Click extension → ✅ Export current tab\n"
-        "`4.` Render Dashboard → Environment\n"
-        "`5.` Key: `YT_COOKIES` → paste **entire file content**\n"
-        "`6.` Save → Manual Deploy\n\n"
-        f"Last error: `{last_err[:100]}`"
+        "🔐 **YouTube download failed.**\n\n"
+        "**Most likely fix:** Update yt-dlp on Render\n"
+        "Add this to `requirements.txt`:\n"
+        "`yt-dlp>=2025.1.1`\n\n"
+        "Or in Render shell: `pip install -U yt-dlp`\n\n"
+        f"`{last_err[:120]}`"
     )
 
 
-# ── Generic yt-dlp (Instagram, TikTok, etc.) ──────────────────────────────
+# ── Terabox download (all domains + proxy) ─────────────────────────────────
+
+async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
+    """
+    Terabox: try multiple approaches since Render IPs are often blocked.
+    Supports all terabox domains including 1024terabox.com
+    """
+    import yt_dlp
+    from config import YT_PROXY  # reuse proxy for terabox too
+
+    base_opts = {
+        "format": "best[ext=mp4]/best",
+        "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "writethumbnail": True,
+        "postprocessors": [],
+        "retries": 3,
+        "socket_timeout": 30,
+        "http_headers": {"User-Agent": CHROME_UA},
+    }
+    if cookie_file:
+        base_opts["cookiefile"] = cookie_file
+    if hook:
+        base_opts["progress_hooks"] = [hook]
+
+    loop = asyncio.get_event_loop()
+    last_err = ""
+
+    # Try with proxy first, then without
+    proxy_opts = [{**base_opts, "proxy": YT_PROXY}, base_opts] if YT_PROXY else [base_opts]
+
+    for opts in proxy_opts:
+        def _run(o=opts):
+            with yt_dlp.YoutubeDL(o) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if not info: return None, None
+                if "entries" in info:
+                    res = [_find_file(out_dir, e, ydl)
+                           for e in (info.get("entries") or []) if e]
+                    return [r for r in res if r] or None, info
+                return _find_file(out_dir, info, ydl), info
+        try:
+            result, meta = await loop.run_in_executor(None, _run)
+            if result: return result, meta
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    raise RuntimeError(
+        f"⛔ Terabox blocked this server's IP.\n"
+        f"Terabox geoblocks many cloud IPs.\n"
+        f"Try a different link or download manually.\n"
+        f"`{last_err[:100]}`"
+    )
+
+
+# ── Generic yt-dlp (Instagram best quality, TikTok, Twitter etc.) ──────────
 
 async def _generic_ydl(url, out_dir, cookie_file, hook, audio_only=False) -> tuple:
     import yt_dlp
+
+    if audio_only:
+        fmt = "bestaudio/best"
+    else:
+        # Best quality — bestvideo+bestaudio for Instagram etc.
+        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
+
     opts = {
-        "format": "bestaudio/best" if audio_only else "best[ext=mp4]/best",
+        "format": fmt,
         "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
         "merge_output_format": "mp4",
         "quiet": True,
@@ -238,9 +327,10 @@ async def _generic_ydl(url, out_dir, cookie_file, hook, audio_only=False) -> tup
     }
     if audio_only:
         opts["postprocessors"] = [{"key": "FFmpegExtractAudio",
-                                    "preferredcodec": "mp3", "preferredquality": "192"}]
+                                    "preferredcodec": "mp3", "preferredquality": "320"}]
     if cookie_file: opts["cookiefile"] = cookie_file
     if hook: opts["progress_hooks"] = [hook]
+
     loop = asyncio.get_event_loop()
     def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -265,11 +355,19 @@ async def download_with_ytdlp(url, out_dir, quality="best",
     if url_type == "youtube":
         return await _yt_download(url, out_dir, quality, audio_only, progress_hook)
 
+    # Terabox — all domains
+    if url_type == "terabox" or any(d in url for d in TERABOX_DOMAINS):
+        cookie_file = _write_cookie_file(TERABOX_COOKIES, "tb") if TERABOX_COOKIES else None
+        try:
+            return await _terabox_download(url, out_dir, cookie_file, progress_hook)
+        finally:
+            if cookie_file and os.path.exists(cookie_file):
+                try: os.remove(cookie_file)
+                except: pass
+
     cookie_file = None
     if url_type == "instagram" and INSTAGRAM_COOKIES:
         cookie_file = _write_cookie_file(INSTAGRAM_COOKIES, "ig")
-    elif url_type == "terabox" and TERABOX_COOKIES:
-        cookie_file = _write_cookie_file(TERABOX_COOKIES, "tb")
 
     try:
         return await _generic_ydl(url, out_dir, cookie_file, progress_hook, audio_only)
@@ -308,7 +406,7 @@ async def download_m3u8(url: str, out_dir: str, progress_hook=None) -> tuple:
         result = await asyncio.wait_for(loop.run_in_executor(None, _run), timeout=310)
         return result, None
     except asyncio.TimeoutError:
-        raise RuntimeError("⏱ Stream download timed out.")
+        raise RuntimeError("⏱ Stream timed out.")
 
 
 # ── Direct file ───────────────────────────────────────────────────────────
