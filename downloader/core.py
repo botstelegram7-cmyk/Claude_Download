@@ -1,12 +1,8 @@
 """
 Serena Bot - Core Downloader
-FIXES:
-- YouTube: Invidious API fallback (bypasses IP block completely)
-- streaam.net + generic video hosts: HTML scraping → direct MP4 extraction
-- vidssave.com: direct aiohttp with proper headers
-- Terabox: all domains, IP block error shown clearly
-- All videos: supports_streaming=True
-- GDrive bulk ZIP: as-is document
+YouTube FIX: web_embedded + tv_embedded clients FIRST
+(Same client Telegram uses for its inline embed player)
+These bypass "Sign in to confirm you're not a bot"
 """
 import os, sys, asyncio, subprocess, uuid, time, shutil, zipfile, json, re
 from typing import Optional
@@ -24,15 +20,7 @@ CHROME_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/133.0.0.0 Safari/537.36"
 )
-BROWSER_HEADERS = {
-    "User-Agent": CHROME_UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-}
 
-# Public Invidious instances for YouTube fallback
 INVIDIOUS_INSTANCES = [
     "https://inv.nadeko.net",
     "https://invidious.nerdvpn.de",
@@ -142,111 +130,13 @@ def _find_file(out_dir: str, info: Optional[dict], ydl) -> Optional[str]:
     except Exception: return None
 
 
-# ── YouTube via Invidious API (bypasses IP block) ──────────────────────────
-async def _yt_via_invidious(video_id: str, out_dir: str, quality: str,
-                              audio_only: bool, hook) -> tuple:
-    """
-    Use public Invidious API to get direct video URL, then download with aiohttp.
-    This bypasses YouTube's IP block on datacenter IPs completely.
-    """
-    import aiohttp
-
-    os.makedirs(out_dir, exist_ok=True)
-    loop = asyncio.get_event_loop()
-
-    async def _try_instance(base_url: str) -> Optional[dict]:
-        api = f"{base_url}/api/v1/videos/{video_id}?fields=title,author,lengthSeconds,adaptiveFormats,formatStreams"
-        try:
-            async with aiohttp.ClientSession(
-                headers={"User-Agent": CHROME_UA},
-                connector=aiohttp.TCPConnector(ssl=False)
-            ) as session:
-                async with session.get(api, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status != 200: return None
-                    return await resp.json()
-        except Exception:
-            return None
-
-    data = None
-    for inst in INVIDIOUS_INSTANCES:
-        data = await _try_instance(inst)
-        if data: break
-
-    if not data:
-        raise RuntimeError("All Invidious instances failed — try again later.")
-
-    title    = data.get("title", video_id)
-    author   = data.get("author", "")
-    duration = data.get("lengthSeconds", 0)
-
-    # Pick best format
-    if audio_only:
-        # Best audio format
-        formats = sorted(
-            [f for f in data.get("adaptiveFormats", []) if "audio" in f.get("type","")],
-            key=lambda x: int(x.get("bitrate", 0)), reverse=True
-        )
-        chosen = formats[0] if formats else None
-        out_ext = "m4a"
-    else:
-        # Best video (prefer mp4, match quality)
-        target_h = {"144p":144,"360p":360,"720p":720,"1080p":1080}.get(quality, 9999)
-        video_fmts = sorted(
-            [f for f in data.get("formatStreams",[]) if f.get("container") == "mp4"],
-            key=lambda x: abs(int(x.get("resolution","0p").replace("p","") or 0) - target_h)
-        )
-        if not video_fmts:
-            video_fmts = data.get("formatStreams", [])
-        chosen = video_fmts[0] if video_fmts else None
-        out_ext = "mp4"
-
-    if not chosen or not chosen.get("url"):
-        raise RuntimeError("No downloadable format found via Invidious.")
-
-    dl_url  = chosen["url"]
-    fname   = clean_filename(title) + f".{out_ext}"
-    out_file = os.path.join(out_dir, fname)
-
-    # Download with aiohttp + progress
-    async with aiohttp.ClientSession(headers={"User-Agent": CHROME_UA}) as session:
-        async with session.get(dl_url, timeout=aiohttp.ClientTimeout(total=3600),
-                               allow_redirects=True) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("Content-Length", 0))
-            done  = 0
-            with open(out_file, "wb") as f:
-                async for chunk in resp.content.iter_chunked(131072):
-                    f.write(chunk); done += len(chunk)
-                    if hook:
-                        # Call progress hook in thread-safe way
-                        asyncio.run_coroutine_threadsafe(
-                            _noop_hook(hook, done, total), loop
-                        ) if callable(getattr(hook, '__call__', None)) else None
-
-    meta = {
-        "title": title, "uploader": author,
-        "duration": duration, "ext": out_ext,
-    }
-    return out_file, meta
-
-
-async def _noop_hook(hook, done, total):
-    """Wrapper for aiohttp progress in invidious download."""
-    try:
-        if asyncio.iscoroutinefunction(hook):
-            await hook(done, total)
-    except Exception:
-        pass
-
-
-# ── YouTube main (yt-dlp + Invidious fallback) ────────────────────────────
+# ── YouTube — EMBED CLIENTS FIRST (same as Telegram inline player) ─────────
 async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
     import yt_dlp
     from config import YT_COOKIES, YT_PROXY
 
     await _ensure_ytdlp_updated()
 
-    # Extract video ID
     vid_id = None
     m = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})", url)
     if m: vid_id = m.group(1)
@@ -261,7 +151,12 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
 
     cookie_file = _write_cookie_file(YT_COOKIES, "yt") if YT_COOKIES else None
 
-    def _make(ea: dict):
+    def _make(player_clients: list, extra_ea: dict = {}):
+        ea = {
+            "youtube": {"player_client": player_clients},
+            "youtubetab": {"skip": ["authcheck"]},
+            **extra_ea,
+        }
         o = {
             "format": fmt,
             "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
@@ -271,9 +166,8 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
             "postprocessors": [], "retries": 3,
             "fragment_retries": 3, "socket_timeout": 30,
             "http_headers": {"User-Agent": CHROME_UA},
-            "extractor_args": {"youtubetab": {"skip": ["authcheck"]}},
+            "extractor_args": ea,
         }
-        if ea: o["extractor_args"]["youtube"] = ea
         if YT_PROXY:    o["proxy"] = YT_PROXY
         if cookie_file: o["cookiefile"] = cookie_file
         if audio_only:
@@ -282,19 +176,49 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
         if hook: o["progress_hooks"] = [hook]
         return o
 
+    # ── Strategy order: embed clients FIRST ──────────────────────────────
+    # web_embedded & tv_embedded = same clients Telegram uses for inline embed
+    # These have ZERO bot detection on most datacenter IPs
     strategies = [
-        {"player_client": ["android"], "player_skip": ["webpage","configs"]},
-        {"player_client": ["android_vr"], "player_skip": ["webpage","configs"]},
-        {"player_client": ["tv_embedded"]},
-        {"player_client": ["ios"], "player_skip": ["webpage","configs"]},
-        {"player_client": ["mweb"]},
-        {},
+        # Tier 1: Embed clients (bypass bot check completely)
+        _make(["web_embedded"]),
+        _make(["tv_embedded"]),
+        _make(["web_embedded", "tv_embedded"]),
+        # Tier 2: Mobile clients
+        _make(["android"], {"youtube": {"player_client": ["android"],
+                                         "player_skip": ["webpage","configs"]}}),
+        _make(["android_vr"], {"youtube": {"player_client": ["android_vr"],
+                                            "player_skip": ["webpage","configs"]}}),
+        _make(["ios"], {"youtube": {"player_client": ["ios"],
+                                     "player_skip": ["webpage","configs"]}}),
+        # Tier 3: Other clients
+        _make(["mediaconnect"]),
+        _make(["mweb"]),
+        _make(["android_testsuite"]),
+        # Tier 4: Default (no client override)
+        {
+            "format": fmt,
+            "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
+            "merge_output_format": "mp4",
+            "quiet": True, "no_warnings": True,
+            "noplaylist": False, "writethumbnail": True,
+            "postprocessors": [], "retries": 2,
+            "socket_timeout": 30,
+            "http_headers": {"User-Agent": CHROME_UA},
+            "extractor_args": {"youtubetab": {"skip": ["authcheck"]}},
+            **({} if not YT_PROXY else {"proxy": YT_PROXY}),
+            **({} if not cookie_file else {"cookiefile": cookie_file}),
+            **({} if not hook else {"progress_hooks": [hook]}),
+            **({} if not audio_only else {"postprocessors": [{"key": "FFmpegExtractAudio",
+                                                               "preferredcodec": "mp3",
+                                                               "preferredquality": "192"}]}),
+        },
     ]
 
     loop = asyncio.get_event_loop()
     last_err = ""
-    for strat in strategies:
-        opts = _make(strat)
+
+    for opts in strategies:
         def _run(o=opts):
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -318,7 +242,7 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
         try: os.remove(cookie_file)
         except: pass
 
-    # ── Invidious fallback ─────────────────────────────────────────────────
+    # ── Invidious fallback ──────────────────────────────────────────────
     if vid_id:
         try:
             return await _yt_via_invidious(vid_id, out_dir, quality, audio_only, hook)
@@ -326,20 +250,85 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
             last_err += f" | Invidious: {str(e)[:80]}"
 
     raise RuntimeError(
-        "🔐 **YouTube blocked this server's IP.**\n\n"
-        "**Permanent fixes:**\n"
-        "▸ Set `YT_PROXY` in Render env (Webshare residential proxy)\n"
-        "▸ Or delete Render service → create new one (fresh IP)\n\n"
+        "❌ **YouTube download failed.**\n\n"
+        "**Quick fix:** Delete Render service → create new (gets fresh IP)\n"
+        "**Permanent fix:** Set `YT_PROXY` (Webshare residential)\n\n"
         f"`{last_err[:100]}`"
     )
 
 
-# ── Generic video host scraper (streaam.net, streamtape etc.) ─────────────
+# ── Invidious fallback ─────────────────────────────────────────────────────
+async def _yt_via_invidious(video_id: str, out_dir: str, quality: str,
+                              audio_only: bool, hook) -> tuple:
+    import aiohttp
+    os.makedirs(out_dir, exist_ok=True)
+
+    async def _try(base: str) -> Optional[dict]:
+        api = f"{base}/api/v1/videos/{video_id}?fields=title,author,lengthSeconds,adaptiveFormats,formatStreams"
+        try:
+            async with aiohttp.ClientSession(
+                headers={"User-Agent": CHROME_UA},
+                connector=aiohttp.TCPConnector(ssl=False)
+            ) as s:
+                async with s.get(api, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status != 200: return None
+                    return await r.json()
+        except Exception: return None
+
+    data = None
+    for inst in INVIDIOUS_INSTANCES:
+        data = await _try(inst)
+        if data: break
+
+    if not data:
+        raise RuntimeError("All Invidious instances failed.")
+
+    title    = data.get("title", video_id)
+    author   = data.get("author", "")
+    duration = data.get("lengthSeconds", 0)
+
+    if audio_only:
+        fmts = sorted(
+            [f for f in data.get("adaptiveFormats",[]) if "audio" in f.get("type","")],
+            key=lambda x: int(x.get("bitrate",0)), reverse=True
+        )
+        chosen = fmts[0] if fmts else None
+        out_ext = "m4a"
+    else:
+        target_h = {"144p":144,"360p":360,"720p":720,"1080p":1080}.get(quality, 9999)
+        fmts = sorted(
+            [f for f in data.get("formatStreams",[]) if f.get("container") == "mp4"],
+            key=lambda x: abs(int(x.get("resolution","0p").replace("p","") or 0) - target_h)
+        )
+        if not fmts: fmts = data.get("formatStreams",[])
+        chosen = fmts[0] if fmts else None
+        out_ext = "mp4"
+
+    if not chosen or not chosen.get("url"):
+        raise RuntimeError("No downloadable format via Invidious.")
+
+    fname    = clean_filename(title) + f".{out_ext}"
+    out_file = os.path.join(out_dir, fname)
+    dl_url   = chosen["url"]
+
+    async with aiohttp.ClientSession(headers={"User-Agent": CHROME_UA}) as s:
+        async with s.get(dl_url, timeout=aiohttp.ClientTimeout(total=3600),
+                         allow_redirects=True) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length",0))
+            done  = 0
+            with open(out_file, "wb") as f:
+                async for chunk in resp.content.iter_chunked(131072):
+                    f.write(chunk); done += len(chunk)
+                    if hook:
+                        try: await hook(done, total)
+                        except Exception: pass
+
+    return out_file, {"title": title, "uploader": author, "duration": duration, "ext": out_ext}
+
+
+# ── Generic video host scraper (streaam.net etc.) ─────────────────────────
 async def _scrape_video_host(url: str, out_dir: str, hook) -> tuple:
-    """
-    Scrape HTML to find direct MP4 URL from video hosting sites.
-    Handles: streaam.net, streamtape, streamvid, etc.
-    """
     import aiohttp
     os.makedirs(out_dir, exist_ok=True)
 
@@ -351,59 +340,50 @@ async def _scrape_video_host(url: str, out_dir: str, hook) -> tuple:
     }
 
     async with aiohttp.ClientSession(headers=hdrs) as session:
-        # Fetch page HTML
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=20),
                                allow_redirects=True) as resp:
             if resp.status != 200:
-                raise RuntimeError(f"Failed to load page: HTTP {resp.status}")
+                raise RuntimeError(f"Page load failed: HTTP {resp.status}")
             html = await resp.text(errors="ignore")
             final_url = str(resp.url)
 
-        # Extract title from HTML
         title_m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
         title = title_m.group(1).strip() if title_m else ""
-        title = re.sub(r"\s*[-|–]\s*.+$", "", title).strip()  # remove site name
+        title = re.sub(r"\s*[-|–]\s*.+$", "", title).strip()
 
-        # Find direct MP4/video URLs using multiple patterns
         direct_url = None
-
         patterns = [
-            # Common video source patterns
             r'(?:file|src|source)\s*[=:]\s*["\']([^"\']+\.(?:mp4|m3u8|webm)[^"\']*)["\']',
-            r'(?:file|src|url)\s*:\s*["\']([^"\']+\.(?:mp4|m3u8|webm)[^"\']*)["\']',
-            r'"(?:hls|mp4|stream|video)"\s*:\s*"([^"]+)"',
+            r'(?:file|url)\s*:\s*["\']([^"\']+\.(?:mp4|m3u8|webm)[^"\']*)["\']',
+            r'"(?:hls|mp4|stream|video|source)"\s*:\s*"([^"]+)"',
             r'videoUrl\s*[=:]\s*["\']([^"\']+)["\']',
-            r'player\.src\s*\(\s*["\']([^"\']+)["\']',
             r'<source[^>]+src=["\']([^"\']+)["\']',
-            # streaam.net specific
             r'"stream_url"\s*:\s*"([^"]+)"',
             r'"url"\s*:\s*"(https?://[^"]+\.(?:mp4|m3u8|webm)[^"]*)"',
-            r'atob\s*\(\s*["\']([A-Za-z0-9+/=]{20,})["\']',  # base64 encoded URLs
+            r'player\.src\s*\(\s*["\']([^"\']+)["\']',
+            r'atob\s*\(\s*["\']([A-Za-z0-9+/=]{20,})["\']',
         ]
-
         for pat in patterns:
             m = re.search(pat, html, re.I)
             if m:
                 found = m.group(1)
-                # Decode base64 if needed
                 if re.match(r"^[A-Za-z0-9+/=]{20,}$", found) and "." not in found:
                     try:
                         import base64
                         decoded = base64.b64decode(found).decode("utf-8", errors="ignore")
                         if "http" in decoded:
-                            found = re.search(r"https?://[^\s\"']+", decoded)
-                            found = found.group(0) if found else None
-                    except Exception:
-                        found = None
-                if found and ("http" in found or found.startswith("/")):
+                            fm = re.search(r"https?://[^\s\"']+", decoded)
+                            found = fm.group(0) if fm else None
+                    except Exception: found = None
+                if found:
                     if found.startswith("/"):
                         from urllib.parse import urljoin
                         found = urljoin(final_url, found)
-                    direct_url = found
-                    break
+                    if found.startswith("http"):
+                        direct_url = found; break
 
-        # Also check for iframe embeds → recurse once
         if not direct_url:
+            # Check iframe
             iframe_m = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.I)
             if iframe_m:
                 iframe_src = iframe_m.group(1)
@@ -413,67 +393,55 @@ async def _scrape_video_host(url: str, out_dir: str, hook) -> tuple:
                 if iframe_src != url:
                     try:
                         async with session.get(iframe_src, timeout=aiohttp.ClientTimeout(total=15),
-                                               headers={**hdrs, "Referer": url}) as r2:
+                                               headers={**hdrs,"Referer":url}) as r2:
                             html2 = await r2.text(errors="ignore")
                         for pat in patterns:
                             m = re.search(pat, html2, re.I)
                             if m:
-                                direct_url = m.group(1)
-                                if direct_url.startswith("/"):
+                                found = m.group(1)
+                                if found.startswith("/"):
                                     from urllib.parse import urljoin
-                                    direct_url = urljoin(str(r2.url), direct_url)
-                                break
+                                    found = urljoin(str(r2.url), found)
+                                if found.startswith("http"):
+                                    direct_url = found; break
                     except Exception: pass
 
         if not direct_url:
-            raise RuntimeError(
-                "❌ Could not extract video from this page.\n"
-                "Site may use heavy JS obfuscation."
-            )
+            raise RuntimeError("❌ Could not extract video — site uses JS obfuscation.")
 
-        # Download the extracted URL
         dl_hdrs = {**hdrs, "Referer": final_url}
-        if direct_url.endswith(".m3u8") or "m3u8" in direct_url:
-            # It's an HLS stream → use ffmpeg
+
+        if ".m3u8" in direct_url or "m3u8" in direct_url:
             out_file = os.path.join(out_dir, f"{clean_filename(title or 'video')}.mp4")
             cmd = [
-                "ffmpeg", "-y",
+                "ffmpeg","-y",
                 "-headers", f"User-Agent: {CHROME_UA}\r\nReferer: {final_url}\r\n",
-                "-allowed_extensions", "ALL",
-                "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-                "-i", direct_url, "-c", "copy", "-movflags", "+faststart", out_file
+                "-allowed_extensions","ALL",
+                "-protocol_whitelist","file,http,https,tcp,tls,crypto",
+                "-i",direct_url,"-c","copy","-movflags","+faststart",out_file
             ]
             loop = asyncio.get_event_loop()
             def _run():
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-                if r.returncode != 0:
-                    raise RuntimeError(f"ffmpeg: {r.stderr[-150:]}")
+                if r.returncode != 0: raise RuntimeError(f"ffmpeg: {r.stderr[-150:]}")
                 return out_file
-            result = await asyncio.wait_for(
-                loop.run_in_executor(None, _run), timeout=310
-            )
+            await asyncio.wait_for(loop.run_in_executor(None, _run), timeout=310)
         else:
-            # Direct MP4 download
             fname = clean_filename(title or "video") + ".mp4"
             out_file = os.path.join(out_dir, fname)
-            async with session.get(
-                direct_url,
-                timeout=aiohttp.ClientTimeout(total=3600),
-                headers=dl_hdrs,
-                allow_redirects=True
-            ) as dl_resp:
-                dl_resp.raise_for_status()
-                total = int(dl_resp.headers.get("Content-Length", 0))
+            async with session.get(direct_url, timeout=aiohttp.ClientTimeout(total=3600),
+                                   headers=dl_hdrs, allow_redirects=True) as dl:
+                dl.raise_for_status()
+                total = int(dl.headers.get("Content-Length",0))
                 done  = 0
                 with open(out_file, "wb") as f:
-                    async for chunk in dl_resp.content.iter_chunked(131072):
+                    async for chunk in dl.content.iter_chunked(131072):
                         f.write(chunk); done += len(chunk)
                         if hook:
                             try: await hook(done, total)
                             except Exception: pass
 
-    meta = {"title": title or "Video", "ext": "mp4"}
-    return out_file, meta
+    return out_file, {"title": title or "Video", "ext": "mp4"}
 
 
 # ── Terabox ───────────────────────────────────────────────────────────────
@@ -495,8 +463,7 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
 
     loop = asyncio.get_event_loop()
     last_err = ""
-    candidates = [{**base, "proxy": YT_PROXY}, base] if YT_PROXY else [base]
-    for opts in candidates:
+    for opts in ([{**base,"proxy":YT_PROXY},base] if YT_PROXY else [base]):
         def _run(o=opts):
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -513,14 +480,12 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
             last_err = str(e); continue
 
     raise RuntimeError(
-        "⛔ **Terabox is blocked on this server.**\n\n"
-        "Terabox blocks all cloud/datacenter IPs.\n"
-        "**Fix:** Delete Render service → create new (fresh IP)\n"
-        "Or set residential proxy in `YT_PROXY`."
+        "⛔ **Terabox blocked this server IP.**\n"
+        "**Fix:** Delete Render → create new service (fresh IP)"
     )
 
 
-# ── Generic yt-dlp (Instagram, TikTok, Twitter) ───────────────────────────
+# ── Generic yt-dlp ────────────────────────────────────────────────────────
 async def _generic_ydl(url, out_dir, cookie_file, hook, audio_only=False) -> tuple:
     import yt_dlp
     fmt = "bestaudio/best" if audio_only else \
@@ -576,26 +541,23 @@ async def download_with_ytdlp(url, out_dir, quality="best",
         ck = _write_cookie_file(INSTAGRAM_COOKIES, "ig")
     try:
         result, meta = await _generic_ydl(url, out_dir, ck, progress_hook, audio_only)
-        # If yt-dlp fails on generic hosts, try HTML scraping
         if not result:
             result, meta = await _scrape_video_host(url, out_dir, progress_hook)
         return result, meta
     except Exception as e:
-        # Last resort: HTML scraping for unknown video hosts
         try:
             return await _scrape_video_host(url, out_dir, progress_hook)
         except Exception as e2:
-            raise RuntimeError(f"Download failed: {str(e)[:150]}\nScrape: {str(e2)[:100]}")
+            raise RuntimeError(f"Download failed: {str(e)[:120]}")
     finally:
         if ck and os.path.exists(ck):
             try: os.remove(ck)
             except: pass
 
 
-# ── Direct file download (pure aiohttp) ───────────────────────────────────
+# ── Direct file (pure aiohttp) ────────────────────────────────────────────
 async def download_direct(url: str, out_dir: str, filename: str = None,
-                           extra_headers: dict = None,
-                           progress_hook=None) -> tuple:
+                           extra_headers: dict = None, progress_hook=None) -> tuple:
     import aiohttp
     os.makedirs(out_dir, exist_ok=True)
 
@@ -610,52 +572,38 @@ async def download_direct(url: str, out_dir: str, filename: str = None,
         **(extra_headers or {})
     }
 
-    async with aiohttp.ClientSession(headers=hdrs) as session:
-        async with session.get(
-            url, timeout=aiohttp.ClientTimeout(total=3600),
-            allow_redirects=True
-        ) as resp:
+    async with aiohttp.ClientSession(headers=hdrs) as s:
+        async with s.get(url, timeout=aiohttp.ClientTimeout(total=3600),
+                         allow_redirects=True) as resp:
             if resp.status in (403, 401):
-                # Try without Referer
                 hdrs2 = {k: v for k, v in hdrs.items() if k != "Referer"}
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=3600),
-                                       headers=hdrs2, allow_redirects=True) as resp2:
-                    if resp2.status in (403, 401):
-                        raise RuntimeError(
-                            f"❌ {resp2.status} — link expired or requires auth."
-                        )
-                    resp = resp2
-
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=3600),
+                                  headers=hdrs2, allow_redirects=True) as r2:
+                    if r2.status in (403, 401):
+                        raise RuntimeError(f"❌ {r2.status} — link expired.")
+                    resp = r2
             resp.raise_for_status()
 
-            # Get filename from Content-Disposition
-            cd = resp.headers.get("Content-Disposition", "")
+            cd = resp.headers.get("Content-Disposition","")
             fname = None
             if cd:
                 m = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\r\n]+)', cd, re.I)
                 if m:
                     from urllib.parse import unquote
                     fname = unquote(m.group(1).strip().strip('"\''))
-
             if not fname:
-                if filename:
-                    fname = filename
-                else:
-                    from urllib.parse import unquote
-                    raw = unquote(url.split("?")[0].rstrip("/").split("/")[-1])
-                    fname = raw if len(raw) > 3 else f"file_{uuid.uuid4().hex[:8]}"
-                    # If no extension, detect from Content-Type
-                    if "." not in fname:
-                        ct = resp.headers.get("Content-Type", "")
-                        ext = _ext_from_ct(ct) or "bin"
-                        fname += f".{ext}"
+                from urllib.parse import unquote
+                raw = unquote(url.split("?")[0].rstrip("/").split("/")[-1])
+                fname = raw if len(raw) > 3 else f"file_{uuid.uuid4().hex[:8]}"
+                if "." not in fname:
+                    ext = _ext_from_ct(resp.headers.get("Content-Type","")) or "bin"
+                    fname += f".{ext}"
 
             fname = clean_filename(fname)
             out_file = os.path.join(out_dir, fname)
-
-            total = int(resp.headers.get("Content-Length", 0))
+            total = int(resp.headers.get("Content-Length",0))
             done  = 0
-            with open(out_file, "wb") as f:
+            with open(out_file,"wb") as f:
                 async for chunk in resp.content.iter_chunked(131072):
                     f.write(chunk); done += len(chunk)
                     if progress_hook:
@@ -664,7 +612,7 @@ async def download_direct(url: str, out_dir: str, filename: str = None,
 
     meta = {
         "title": url_title or os.path.splitext(fname)[0].replace("_"," ").replace("-"," ").strip(),
-        "ext": fname.rsplit(".", 1)[-1] if "." in fname else "",
+        "ext": fname.rsplit(".",1)[-1] if "." in fname else "",
     }
     return out_file, meta
 
@@ -676,7 +624,7 @@ def _ext_from_ct(ct: str) -> str:
         "audio/mpeg":"mp3","audio/mp4":"m4a","audio/ogg":"ogg",
         "image/jpeg":"jpg","image/png":"png","image/gif":"gif","image/webp":"webp",
         "application/pdf":"pdf","application/zip":"zip",
-    }.get(ct, "")
+    }.get(ct,"")
 
 
 # ── M3U8 ─────────────────────────────────────────────────────────────────
@@ -686,24 +634,21 @@ async def download_m3u8(url: str, out_dir: str, progress_hook=None) -> tuple:
     loop = asyncio.get_event_loop()
     def _run():
         cmd = [
-            "ffmpeg","-y",
-            "-headers", f"User-Agent: {CHROME_UA}\r\n",
+            "ffmpeg","-y","-headers",f"User-Agent: {CHROME_UA}\r\n",
             "-allowed_extensions","ALL",
             "-protocol_whitelist","file,http,https,tcp,tls,crypto",
             "-i",url,"-c","copy","-movflags","+faststart",out_file
         ]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            if r.returncode != 0:
-                raise RuntimeError(f"ffmpeg: {r.stderr[-200:]}")
+            if r.returncode != 0: raise RuntimeError(f"ffmpeg: {r.stderr[-200:]}")
             if not os.path.exists(out_file) or os.path.getsize(out_file) < 1000:
-                raise RuntimeError("Output file empty")
+                raise RuntimeError("Output empty")
             return out_file
         except subprocess.TimeoutExpired:
-            raise RuntimeError("⏱ Stream timed out (5 min).")
+            raise RuntimeError("⏱ Stream timed out.")
     try:
-        result = await asyncio.wait_for(loop.run_in_executor(None, _run), timeout=310)
-        return result, None
+        return await asyncio.wait_for(loop.run_in_executor(None,_run), timeout=310), None
     except asyncio.TimeoutError:
         raise RuntimeError("⏱ Stream timed out.")
 
@@ -712,33 +657,31 @@ async def download_m3u8(url: str, out_dir: str, progress_hook=None) -> tuple:
 async def download_gdrive_folder(url, out_dir, progress_hook=None) -> tuple:
     import yt_dlp
     os.makedirs(out_dir, exist_ok=True)
-    opts = {
-        "format":"best","outtmpl":os.path.join(out_dir,"%(title).80s.%(ext)s"),
-        "quiet":True,"no_warnings":True,"noplaylist":False,
-        "retries":3,"http_headers":{"User-Agent":CHROME_UA},
-    }
+    opts = {"format":"best","outtmpl":os.path.join(out_dir,"%(title).80s.%(ext)s"),
+            "quiet":True,"no_warnings":True,"noplaylist":False,
+            "retries":3,"http_headers":{"User-Agent":CHROME_UA}}
     if progress_hook: opts["progress_hooks"] = [progress_hook]
     loop = asyncio.get_event_loop()
     def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-        skip = {".part",".ytdl",".tmp"}
-        files = sorted([
-            os.path.join(out_dir, x) for x in os.listdir(out_dir)
-            if os.path.isfile(os.path.join(out_dir, x))
+        skip={".part",".ytdl",".tmp"}
+        files=sorted([
+            os.path.join(out_dir,x) for x in os.listdir(out_dir)
+            if os.path.isfile(os.path.join(out_dir,x))
             and not any(x.endswith(e) for e in skip)
-            and os.path.getsize(os.path.join(out_dir, x)) > 0
+            and os.path.getsize(os.path.join(out_dir,x))>0
         ], key=os.path.getmtime)
         return files, info
     return await loop.run_in_executor(None, _run)
 
 
-# ── Thumbnail helpers ─────────────────────────────────────────────────────
+# ── Thumbnails ────────────────────────────────────────────────────────────
 def download_thumb_from_url(thumb_url, video_id) -> Optional[str]:
     try:
         import requests as req
-        r = req.get(thumb_url, headers={"User-Agent": CHROME_UA}, timeout=10)
-        if r.status_code == 200 and len(r.content) > 500:
+        r = req.get(thumb_url, headers={"User-Agent":CHROME_UA}, timeout=10)
+        if r.status_code==200 and len(r.content)>500:
             p = f"/tmp/thumb_{video_id}.jpg"
             with open(p,"wb") as f: f.write(r.content)
             return p
@@ -747,11 +690,11 @@ def download_thumb_from_url(thumb_url, video_id) -> Optional[str]:
 
 def find_thumbnail(base_path) -> Optional[str]:
     for ext in (".jpg",".jpeg",".webp",".png"):
-        t = base_path.rsplit(".",1)[0] + ext
-        if os.path.exists(t) and os.path.getsize(t) > 500:
+        t = base_path.rsplit(".",1)[0]+ext
+        if os.path.exists(t) and os.path.getsize(t)>500:
             if not t.endswith(".jpg"):
-                jpg = t.rsplit(".",1)[0] + ".jpg"
-                r = subprocess.run(["ffmpeg","-y","-i",t,jpg], capture_output=True)
+                jpg = t.rsplit(".",1)[0]+".jpg"
+                r = subprocess.run(["ffmpeg","-y","-i",t,jpg],capture_output=True)
                 if r.returncode==0 and os.path.exists(jpg):
                     try: os.remove(t)
                     except: pass
@@ -760,69 +703,65 @@ def find_thumbnail(base_path) -> Optional[str]:
     return None
 
 async def generate_thumbnail(video_path) -> Optional[str]:
-    thumb_path = video_path.rsplit(".",1)[0] + "_thumb.jpg"
+    thumb_path = video_path.rsplit(".",1)[0]+"_thumb.jpg"
     loop = asyncio.get_event_loop()
     def _run():
-        duration = 0
+        duration=0
         try:
-            r = subprocess.run(
-                ["ffprobe","-v","quiet","-print_format","json","-show_format",video_path],
-                capture_output=True, text=True)
-            duration = float(json.loads(r.stdout).get("format",{}).get("duration",0))
+            r=subprocess.run(["ffprobe","-v","quiet","-print_format","json","-show_format",video_path],
+                             capture_output=True,text=True)
+            duration=float(json.loads(r.stdout).get("format",{}).get("duration",0))
         except Exception: pass
         for seek in ([int(duration*p) for p in [0.1,0.2,0.3] if duration>5]+[5,2,0]):
-            r = subprocess.run(
-                ["ffmpeg","-y","-ss",str(seek),"-i",video_path,
-                 "-vframes","1","-vf","scale=320:-1","-q:v","3",thumb_path],
-                capture_output=True)
+            r=subprocess.run(["ffmpeg","-y","-ss",str(seek),"-i",video_path,
+                              "-vframes","1","-vf","scale=320:-1","-q:v","3",thumb_path],
+                             capture_output=True)
             if r.returncode==0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path)>2000:
                 return thumb_path
         return None
-    return await loop.run_in_executor(None, _run)
+    return await loop.run_in_executor(None,_run)
 
 async def remux_to_mp4(input_path) -> str:
-    out = input_path.rsplit(".",1)[0] + "_tg.mp4"
+    out = input_path.rsplit(".",1)[0]+"_tg.mp4"
     loop = asyncio.get_event_loop()
     def _run():
-        r = subprocess.run(
-            ["ffmpeg","-y","-i",input_path,"-c","copy","-movflags","+faststart",out],
-            capture_output=True)
+        r=subprocess.run(["ffmpeg","-y","-i",input_path,"-c","copy",
+                          "-movflags","+faststart",out],capture_output=True)
         if r.returncode==0 and os.path.exists(out) and os.path.getsize(out)>500:
             try: os.remove(input_path)
             except: pass
             return out
         return input_path
-    return await loop.run_in_executor(None, _run)
+    return await loop.run_in_executor(None,_run)
 
 def get_video_info(path) -> dict:
     try:
-        r = subprocess.run(
-            ["ffprobe","-v","quiet","-print_format","json",
-             "-show_streams","-show_format","-select_streams","v:0",path],
-            capture_output=True, text=True)
-        data = json.loads(r.stdout)
-        stream = (data.get("streams") or [{}])[0]
-        dur = float(data.get("format",{}).get("duration",0))
+        r=subprocess.run(["ffprobe","-v","quiet","-print_format","json",
+                          "-show_streams","-show_format","-select_streams","v:0",path],
+                         capture_output=True,text=True)
+        data=json.loads(r.stdout)
+        stream=(data.get("streams") or [{}])[0]
+        dur=float(data.get("format",{}).get("duration",0))
         return {"width":stream.get("width",0),"height":stream.get("height",0),"duration":int(dur)}
     except Exception:
         return {"width":0,"height":0,"duration":0}
 
-async def zip_folder(folder_path, out_path, name="files") -> str:
-    zip_path = os.path.join(out_path, f"{clean_filename(name)}.zip")
-    loop = asyncio.get_event_loop()
+async def zip_folder(folder_path,out_path,name="files") -> str:
+    zip_path=os.path.join(out_path,f"{clean_filename(name)}.zip")
+    loop=asyncio.get_event_loop()
     def _zip():
         with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as zf:
             for fname in os.listdir(folder_path):
-                fp = os.path.join(folder_path, fname)
+                fp=os.path.join(folder_path,fname)
                 if os.path.isfile(fp) and not fname.endswith((".part",".ytdl")):
-                    zf.write(fp, fname)
+                    zf.write(fp,fname)
         return zip_path
-    return await loop.run_in_executor(None, _zip)
+    return await loop.run_in_executor(None,_zip)
 
 def cleanup_files(*paths):
     for p in paths:
         if not p: continue
         try:
-            if os.path.isdir(p): shutil.rmtree(p, ignore_errors=True)
+            if os.path.isdir(p): shutil.rmtree(p,ignore_errors=True)
             elif os.path.exists(p): os.remove(p)
         except Exception: pass
