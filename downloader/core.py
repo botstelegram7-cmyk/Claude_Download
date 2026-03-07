@@ -1,13 +1,14 @@
 """
 Serena Bot - Core Downloader
 FIXES:
-- Direct links: pure aiohttp, skip yt-dlp (403 fix)
-- GDrive bulk export (storage.googleapis.com): download as-is ZIP
-- Instagram: best quality (bestvideo+bestaudio)
-- YouTube: yt-dlp auto-update + playlist authcheck skip
-- Terabox: all domains + proxy
+- YouTube: Invidious API fallback (bypasses IP block completely)
+- streaam.net + generic video hosts: HTML scraping → direct MP4 extraction
+- vidssave.com: direct aiohttp with proper headers
+- Terabox: all domains, IP block error shown clearly
+- All videos: supports_streaming=True
+- GDrive bulk ZIP: as-is document
 """
-import os, sys, asyncio, subprocess, uuid, time, shutil, zipfile, json
+import os, sys, asyncio, subprocess, uuid, time, shutil, zipfile, json, re
 from typing import Optional
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -25,17 +26,24 @@ CHROME_UA = (
 )
 BROWSER_HEADERS = {
     "User-Agent": CHROME_UA,
-    "Accept": "video/webm,video/mp4,video/*;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "identity",   # no gzip — we need raw bytes for video
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
-    "Referer": "https://www.google.com/",
 }
 
+# Public Invidious instances for YouTube fallback
+INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://invidious.privacydev.net",
+    "https://vid.puffyan.us",
+    "https://y.com.sb",
+]
 
-# ── yt-dlp auto-update on first use ───────────────────────────────────────
+
+# ── yt-dlp auto-update ─────────────────────────────────────────────────────
 _ytdlp_updated = False
-
 async def _ensure_ytdlp_updated():
     global _ytdlp_updated
     if _ytdlp_updated: return
@@ -44,14 +52,14 @@ async def _ensure_ytdlp_updated():
     def _upd():
         try:
             subprocess.run(
-                ["pip", "install", "--upgrade", "yt-dlp", "--break-system-packages", "-q"],
+                ["pip","install","--upgrade","yt-dlp","--break-system-packages","-q"],
                 capture_output=True, timeout=60
             )
         except Exception: pass
     await loop.run_in_executor(None, _upd)
 
 
-# ── Cookie file writer ────────────────────────────────────────────────────
+# ── Cookie file writer ─────────────────────────────────────────────────────
 def _write_cookie_file(raw: str, prefix: str) -> Optional[str]:
     if not raw or not raw.strip(): return None
     content = raw.strip().strip('"').strip("'")
@@ -71,8 +79,7 @@ def _write_cookie_file(raw: str, prefix: str) -> Optional[str]:
             f.write(content)
             if not content.endswith("\n"): f.write("\n")
         return path
-    except Exception:
-        return None
+    except Exception: return None
 
 
 async def check_yt_cookies_status() -> dict:
@@ -84,9 +91,8 @@ async def check_yt_cookies_status() -> dict:
     path = _write_cookie_file(YT_COOKIES, "yt_check")
     if not path:
         return {"valid": False, "expired": False,
-                "message": "❌ Cookie content invalid — check format."}
-    now = int(time.time())
-    valid = expired = 0; nearest = None
+                "message": "❌ Cookie content invalid."}
+    now = int(time.time()); valid = expired = 0; nearest = None
     try:
         with open(path) as f:
             for line in f:
@@ -107,24 +113,23 @@ async def check_yt_cookies_status() -> dict:
         except: pass
     if valid == 0 and expired > 0:
         return {"valid": False, "expired": True,
-                "message": f"⚠️ All **{expired}** cookies expired! Export fresh cookies."}
+                "message": f"⚠️ All **{expired}** cookies expired!"}
     if valid > 0:
         exp_str = datetime.utcfromtimestamp(nearest).strftime("%Y-%m-%d") if nearest else "session"
         return {"valid": True, "expired": False,
-                "message": f"✅ **{valid}** valid entries. Expiry: `{exp_str}`"}
-    return {"valid": False, "expired": False, "message": "❌ No valid entries found."}
+                "message": f"✅ **{valid}** valid. Expiry: `{exp_str}`"}
+    return {"valid": False, "expired": False, "message": "❌ No valid entries."}
 
 
 # ── File finder ────────────────────────────────────────────────────────────
 def _find_file(out_dir: str, info: Optional[dict], ydl) -> Optional[str]:
-    skip = {".jpg", ".jpeg", ".png", ".webp", ".part", ".ytdl", ".tmp"}
+    skip = {".jpg",".jpeg",".png",".webp",".part",".ytdl",".tmp"}
     if info:
         try:
             f = ydl.prepare_filename(info)
             base = os.path.splitext(f)[0]
-            for c in [f] + [f"{base}.{e}" for e in ["mp4","mkv","webm","mov","mp3","m4a","opus"]]:
-                if os.path.exists(c) and os.path.getsize(c) > 500:
-                    return c
+            for c in [f]+[f"{base}.{e}" for e in ["mp4","mkv","webm","mov","mp3","m4a","opus"]]:
+                if os.path.exists(c) and os.path.getsize(c) > 500: return c
         except Exception: pass
     try:
         files = [
@@ -134,16 +139,117 @@ def _find_file(out_dir: str, info: Optional[dict], ydl) -> Optional[str]:
             and os.path.getsize(os.path.join(out_dir, x)) > 500
         ]
         return max(files, key=os.path.getmtime) if files else None
+    except Exception: return None
+
+
+# ── YouTube via Invidious API (bypasses IP block) ──────────────────────────
+async def _yt_via_invidious(video_id: str, out_dir: str, quality: str,
+                              audio_only: bool, hook) -> tuple:
+    """
+    Use public Invidious API to get direct video URL, then download with aiohttp.
+    This bypasses YouTube's IP block on datacenter IPs completely.
+    """
+    import aiohttp
+
+    os.makedirs(out_dir, exist_ok=True)
+    loop = asyncio.get_event_loop()
+
+    async def _try_instance(base_url: str) -> Optional[dict]:
+        api = f"{base_url}/api/v1/videos/{video_id}?fields=title,author,lengthSeconds,adaptiveFormats,formatStreams"
+        try:
+            async with aiohttp.ClientSession(
+                headers={"User-Agent": CHROME_UA},
+                connector=aiohttp.TCPConnector(ssl=False)
+            ) as session:
+                async with session.get(api, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200: return None
+                    return await resp.json()
+        except Exception:
+            return None
+
+    data = None
+    for inst in INVIDIOUS_INSTANCES:
+        data = await _try_instance(inst)
+        if data: break
+
+    if not data:
+        raise RuntimeError("All Invidious instances failed — try again later.")
+
+    title    = data.get("title", video_id)
+    author   = data.get("author", "")
+    duration = data.get("lengthSeconds", 0)
+
+    # Pick best format
+    if audio_only:
+        # Best audio format
+        formats = sorted(
+            [f for f in data.get("adaptiveFormats", []) if "audio" in f.get("type","")],
+            key=lambda x: int(x.get("bitrate", 0)), reverse=True
+        )
+        chosen = formats[0] if formats else None
+        out_ext = "m4a"
+    else:
+        # Best video (prefer mp4, match quality)
+        target_h = {"144p":144,"360p":360,"720p":720,"1080p":1080}.get(quality, 9999)
+        video_fmts = sorted(
+            [f for f in data.get("formatStreams",[]) if f.get("container") == "mp4"],
+            key=lambda x: abs(int(x.get("resolution","0p").replace("p","") or 0) - target_h)
+        )
+        if not video_fmts:
+            video_fmts = data.get("formatStreams", [])
+        chosen = video_fmts[0] if video_fmts else None
+        out_ext = "mp4"
+
+    if not chosen or not chosen.get("url"):
+        raise RuntimeError("No downloadable format found via Invidious.")
+
+    dl_url  = chosen["url"]
+    fname   = clean_filename(title) + f".{out_ext}"
+    out_file = os.path.join(out_dir, fname)
+
+    # Download with aiohttp + progress
+    async with aiohttp.ClientSession(headers={"User-Agent": CHROME_UA}) as session:
+        async with session.get(dl_url, timeout=aiohttp.ClientTimeout(total=3600),
+                               allow_redirects=True) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length", 0))
+            done  = 0
+            with open(out_file, "wb") as f:
+                async for chunk in resp.content.iter_chunked(131072):
+                    f.write(chunk); done += len(chunk)
+                    if hook:
+                        # Call progress hook in thread-safe way
+                        asyncio.run_coroutine_threadsafe(
+                            _noop_hook(hook, done, total), loop
+                        ) if callable(getattr(hook, '__call__', None)) else None
+
+    meta = {
+        "title": title, "uploader": author,
+        "duration": duration, "ext": out_ext,
+    }
+    return out_file, meta
+
+
+async def _noop_hook(hook, done, total):
+    """Wrapper for aiohttp progress in invidious download."""
+    try:
+        if asyncio.iscoroutinefunction(hook):
+            await hook(done, total)
     except Exception:
-        return None
+        pass
 
 
-# ── YouTube ───────────────────────────────────────────────────────────────
+# ── YouTube main (yt-dlp + Invidious fallback) ────────────────────────────
 async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
     import yt_dlp
     from config import YT_COOKIES, YT_PROXY
 
     await _ensure_ytdlp_updated()
+
+    # Extract video ID
+    vid_id = None
+    m = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})", url)
+    if m: vid_id = m.group(1)
 
     fmt = "bestaudio/best" if audio_only else {
         "144p":  "best[height<=144]/worst",
@@ -165,7 +271,6 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
             "postprocessors": [], "retries": 3,
             "fragment_retries": 3, "socket_timeout": 30,
             "http_headers": {"User-Agent": CHROME_UA},
-            # Fix: skip authcheck warning for playlists
             "extractor_args": {"youtubetab": {"skip": ["authcheck"]}},
         }
         if ea: o["extractor_args"]["youtube"] = ea
@@ -178,10 +283,10 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
         return o
 
     strategies = [
-        {"player_client": ["android"], "player_skip": ["webpage", "configs"]},
-        {"player_client": ["android_vr"], "player_skip": ["webpage", "configs"]},
+        {"player_client": ["android"], "player_skip": ["webpage","configs"]},
+        {"player_client": ["android_vr"], "player_skip": ["webpage","configs"]},
         {"player_client": ["tv_embedded"]},
-        {"player_client": ["ios"], "player_skip": ["webpage", "configs"]},
+        {"player_client": ["ios"], "player_skip": ["webpage","configs"]},
         {"player_client": ["mweb"]},
         {},
     ]
@@ -207,17 +312,168 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
                     except: pass
                 return result, meta
         except Exception as e:
-            last_err = str(e)
-            continue
+            last_err = str(e); continue
 
     if cookie_file:
         try: os.remove(cookie_file)
         except: pass
+
+    # ── Invidious fallback ─────────────────────────────────────────────────
+    if vid_id:
+        try:
+            return await _yt_via_invidious(vid_id, out_dir, quality, audio_only, hook)
+        except Exception as e:
+            last_err += f" | Invidious: {str(e)[:80]}"
+
     raise RuntimeError(
-        "🔐 **YouTube failed.**\n"
-        "Update yt-dlp or set fresh cookies.\n"
-        f"`{last_err[:120]}`"
+        "🔐 **YouTube blocked this server's IP.**\n\n"
+        "**Permanent fixes:**\n"
+        "▸ Set `YT_PROXY` in Render env (Webshare residential proxy)\n"
+        "▸ Or delete Render service → create new one (fresh IP)\n\n"
+        f"`{last_err[:100]}`"
     )
+
+
+# ── Generic video host scraper (streaam.net, streamtape etc.) ─────────────
+async def _scrape_video_host(url: str, out_dir: str, hook) -> tuple:
+    """
+    Scrape HTML to find direct MP4 URL from video hosting sites.
+    Handles: streaam.net, streamtape, streamvid, etc.
+    """
+    import aiohttp
+    os.makedirs(out_dir, exist_ok=True)
+
+    hdrs = {
+        "User-Agent": CHROME_UA,
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": url,
+    }
+
+    async with aiohttp.ClientSession(headers=hdrs) as session:
+        # Fetch page HTML
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20),
+                               allow_redirects=True) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"Failed to load page: HTTP {resp.status}")
+            html = await resp.text(errors="ignore")
+            final_url = str(resp.url)
+
+        # Extract title from HTML
+        title_m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+        title = title_m.group(1).strip() if title_m else ""
+        title = re.sub(r"\s*[-|–]\s*.+$", "", title).strip()  # remove site name
+
+        # Find direct MP4/video URLs using multiple patterns
+        direct_url = None
+
+        patterns = [
+            # Common video source patterns
+            r'(?:file|src|source)\s*[=:]\s*["\']([^"\']+\.(?:mp4|m3u8|webm)[^"\']*)["\']',
+            r'(?:file|src|url)\s*:\s*["\']([^"\']+\.(?:mp4|m3u8|webm)[^"\']*)["\']',
+            r'"(?:hls|mp4|stream|video)"\s*:\s*"([^"]+)"',
+            r'videoUrl\s*[=:]\s*["\']([^"\']+)["\']',
+            r'player\.src\s*\(\s*["\']([^"\']+)["\']',
+            r'<source[^>]+src=["\']([^"\']+)["\']',
+            # streaam.net specific
+            r'"stream_url"\s*:\s*"([^"]+)"',
+            r'"url"\s*:\s*"(https?://[^"]+\.(?:mp4|m3u8|webm)[^"]*)"',
+            r'atob\s*\(\s*["\']([A-Za-z0-9+/=]{20,})["\']',  # base64 encoded URLs
+        ]
+
+        for pat in patterns:
+            m = re.search(pat, html, re.I)
+            if m:
+                found = m.group(1)
+                # Decode base64 if needed
+                if re.match(r"^[A-Za-z0-9+/=]{20,}$", found) and "." not in found:
+                    try:
+                        import base64
+                        decoded = base64.b64decode(found).decode("utf-8", errors="ignore")
+                        if "http" in decoded:
+                            found = re.search(r"https?://[^\s\"']+", decoded)
+                            found = found.group(0) if found else None
+                    except Exception:
+                        found = None
+                if found and ("http" in found or found.startswith("/")):
+                    if found.startswith("/"):
+                        from urllib.parse import urljoin
+                        found = urljoin(final_url, found)
+                    direct_url = found
+                    break
+
+        # Also check for iframe embeds → recurse once
+        if not direct_url:
+            iframe_m = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.I)
+            if iframe_m:
+                iframe_src = iframe_m.group(1)
+                if iframe_src.startswith("/"):
+                    from urllib.parse import urljoin
+                    iframe_src = urljoin(final_url, iframe_src)
+                if iframe_src != url:
+                    try:
+                        async with session.get(iframe_src, timeout=aiohttp.ClientTimeout(total=15),
+                                               headers={**hdrs, "Referer": url}) as r2:
+                            html2 = await r2.text(errors="ignore")
+                        for pat in patterns:
+                            m = re.search(pat, html2, re.I)
+                            if m:
+                                direct_url = m.group(1)
+                                if direct_url.startswith("/"):
+                                    from urllib.parse import urljoin
+                                    direct_url = urljoin(str(r2.url), direct_url)
+                                break
+                    except Exception: pass
+
+        if not direct_url:
+            raise RuntimeError(
+                "❌ Could not extract video from this page.\n"
+                "Site may use heavy JS obfuscation."
+            )
+
+        # Download the extracted URL
+        dl_hdrs = {**hdrs, "Referer": final_url}
+        if direct_url.endswith(".m3u8") or "m3u8" in direct_url:
+            # It's an HLS stream → use ffmpeg
+            out_file = os.path.join(out_dir, f"{clean_filename(title or 'video')}.mp4")
+            cmd = [
+                "ffmpeg", "-y",
+                "-headers", f"User-Agent: {CHROME_UA}\r\nReferer: {final_url}\r\n",
+                "-allowed_extensions", "ALL",
+                "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                "-i", direct_url, "-c", "copy", "-movflags", "+faststart", out_file
+            ]
+            loop = asyncio.get_event_loop()
+            def _run():
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                if r.returncode != 0:
+                    raise RuntimeError(f"ffmpeg: {r.stderr[-150:]}")
+                return out_file
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _run), timeout=310
+            )
+        else:
+            # Direct MP4 download
+            fname = clean_filename(title or "video") + ".mp4"
+            out_file = os.path.join(out_dir, fname)
+            async with session.get(
+                direct_url,
+                timeout=aiohttp.ClientTimeout(total=3600),
+                headers=dl_hdrs,
+                allow_redirects=True
+            ) as dl_resp:
+                dl_resp.raise_for_status()
+                total = int(dl_resp.headers.get("Content-Length", 0))
+                done  = 0
+                with open(out_file, "wb") as f:
+                    async for chunk in dl_resp.content.iter_chunked(131072):
+                        f.write(chunk); done += len(chunk)
+                        if hook:
+                            try: await hook(done, total)
+                            except Exception: pass
+
+    meta = {"title": title or "Video", "ext": "mp4"}
+    return out_file, meta
 
 
 # ── Terabox ───────────────────────────────────────────────────────────────
@@ -254,21 +510,21 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
             result, meta = await loop.run_in_executor(None, _run)
             if result: return result, meta
         except Exception as e:
-            last_err = str(e)
-            continue
+            last_err = str(e); continue
 
     raise RuntimeError(
-        f"⛔ Terabox blocked this server's IP.\n`{last_err[:100]}`"
+        "⛔ **Terabox is blocked on this server.**\n\n"
+        "Terabox blocks all cloud/datacenter IPs.\n"
+        "**Fix:** Delete Render service → create new (fresh IP)\n"
+        "Or set residential proxy in `YT_PROXY`."
     )
 
 
-# ── Generic yt-dlp (Instagram best, TikTok, Twitter etc.) ────────────────
+# ── Generic yt-dlp (Instagram, TikTok, Twitter) ───────────────────────────
 async def _generic_ydl(url, out_dir, cookie_file, hook, audio_only=False) -> tuple:
     import yt_dlp
-
     fmt = "bestaudio/best" if audio_only else \
           "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
-
     opts = {
         "format": fmt,
         "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
@@ -283,7 +539,6 @@ async def _generic_ydl(url, out_dir, cookie_file, hook, audio_only=False) -> tup
                                     "preferredcodec": "mp3", "preferredquality": "320"}]
     if cookie_file: opts["cookiefile"] = cookie_file
     if hook: opts["progress_hooks"] = [hook]
-
     loop = asyncio.get_event_loop()
     def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -320,51 +575,64 @@ async def download_with_ytdlp(url, out_dir, quality="best",
     if url_type == "instagram" and INSTAGRAM_COOKIES:
         ck = _write_cookie_file(INSTAGRAM_COOKIES, "ig")
     try:
-        return await _generic_ydl(url, out_dir, ck, progress_hook, audio_only)
+        result, meta = await _generic_ydl(url, out_dir, ck, progress_hook, audio_only)
+        # If yt-dlp fails on generic hosts, try HTML scraping
+        if not result:
+            result, meta = await _scrape_video_host(url, out_dir, progress_hook)
+        return result, meta
     except Exception as e:
-        raise RuntimeError(f"Download failed: {str(e)[:200]}")
+        # Last resort: HTML scraping for unknown video hosts
+        try:
+            return await _scrape_video_host(url, out_dir, progress_hook)
+        except Exception as e2:
+            raise RuntimeError(f"Download failed: {str(e)[:150]}\nScrape: {str(e2)[:100]}")
     finally:
         if ck and os.path.exists(ck):
             try: os.remove(ck)
             except: pass
 
 
-# ── Direct file download (aiohttp — no yt-dlp, handles 403 better) ────────
+# ── Direct file download (pure aiohttp) ───────────────────────────────────
 async def download_direct(url: str, out_dir: str, filename: str = None,
                            extra_headers: dict = None,
                            progress_hook=None) -> tuple:
-    """
-    Pure aiohttp download for direct links.
-    - Reads filename from Content-Disposition header or ?title= param
-    - Returns (filepath, meta) where meta has 'title' set from URL/headers
-    """
     import aiohttp
     os.makedirs(out_dir, exist_ok=True)
 
-    # Pre-extract title from URL for caption
     url_title = get_title_from_url(url)
-
-    hdrs = {**BROWSER_HEADERS, **(extra_headers or {})}
+    hdrs = {
+        "User-Agent": CHROME_UA,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",
+        "Connection": "keep-alive",
+        "Referer": "/".join(url.split("/")[:3]) + "/",
+        **(extra_headers or {})
+    }
 
     async with aiohttp.ClientSession(headers=hdrs) as session:
         async with session.get(
-            url,
-            timeout=aiohttp.ClientTimeout(total=3600),
+            url, timeout=aiohttp.ClientTimeout(total=3600),
             allow_redirects=True
         ) as resp:
             if resp.status in (403, 401):
-                raise RuntimeError(
-                    f"❌ {resp.status} — link expired or access denied.\n"
-                    "Try downloading again with a fresh link."
-                )
+                # Try without Referer
+                hdrs2 = {k: v for k, v in hdrs.items() if k != "Referer"}
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=3600),
+                                       headers=hdrs2, allow_redirects=True) as resp2:
+                    if resp2.status in (403, 401):
+                        raise RuntimeError(
+                            f"❌ {resp2.status} — link expired or requires auth."
+                        )
+                    resp = resp2
+
             resp.raise_for_status()
 
-            # Get filename from Content-Disposition header
+            # Get filename from Content-Disposition
             cd = resp.headers.get("Content-Disposition", "")
             fname = None
             if cd:
-                m = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\r\n]+)',
-                               cd, re.I)
+                m = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\r\n]+)', cd, re.I)
                 if m:
                     from urllib.parse import unquote
                     fname = unquote(m.group(1).strip().strip('"\''))
@@ -373,29 +641,29 @@ async def download_direct(url: str, out_dir: str, filename: str = None,
                 if filename:
                     fname = filename
                 else:
-                    # Extract from URL path
                     from urllib.parse import unquote
-                    fname = unquote(url.split("?")[0].rstrip("/").split("/")[-1])
-                    if not fname or len(fname) < 3:
+                    raw = unquote(url.split("?")[0].rstrip("/").split("/")[-1])
+                    fname = raw if len(raw) > 3 else f"file_{uuid.uuid4().hex[:8]}"
+                    # If no extension, detect from Content-Type
+                    if "." not in fname:
                         ct = resp.headers.get("Content-Type", "")
                         ext = _ext_from_ct(ct) or "bin"
-                        fname = f"file_{uuid.uuid4().hex[:8]}.{ext}"
+                        fname += f".{ext}"
 
             fname = clean_filename(fname)
             out_file = os.path.join(out_dir, fname)
 
             total = int(resp.headers.get("Content-Length", 0))
-            done = 0
+            done  = 0
             with open(out_file, "wb") as f:
-                async for chunk in resp.content.iter_chunked(131072):  # 128KB
-                    f.write(chunk)
-                    done += len(chunk)
+                async for chunk in resp.content.iter_chunked(131072):
+                    f.write(chunk); done += len(chunk)
                     if progress_hook:
-                        await progress_hook(done, total)
+                        try: await progress_hook(done, total)
+                        except Exception: pass
 
-    # Build minimal meta with title
     meta = {
-        "title": url_title or os.path.splitext(fname)[0].replace("_", " ").replace("-", " ").strip(),
+        "title": url_title or os.path.splitext(fname)[0].replace("_"," ").replace("-"," ").strip(),
         "ext": fname.rsplit(".", 1)[-1] if "." in fname else "",
     }
     return out_file, meta
@@ -404,15 +672,11 @@ async def download_direct(url: str, out_dir: str, filename: str = None,
 def _ext_from_ct(ct: str) -> str:
     ct = ct.split(";")[0].strip().lower()
     return {
-        "video/mp4": "mp4", "video/webm": "webm", "video/x-matroska": "mkv",
-        "audio/mpeg": "mp3", "audio/mp4": "m4a", "audio/ogg": "ogg",
-        "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp",
-        "application/pdf": "pdf", "application/zip": "zip",
-        "application/x-rar-compressed": "rar",
+        "video/mp4":"mp4","video/webm":"webm","video/x-matroska":"mkv",
+        "audio/mpeg":"mp3","audio/mp4":"m4a","audio/ogg":"ogg",
+        "image/jpeg":"jpg","image/png":"png","image/gif":"gif","image/webp":"webp",
+        "application/pdf":"pdf","application/zip":"zip",
     }.get(ct, "")
-
-
-import re
 
 
 # ── M3U8 ─────────────────────────────────────────────────────────────────
@@ -422,21 +686,21 @@ async def download_m3u8(url: str, out_dir: str, progress_hook=None) -> tuple:
     loop = asyncio.get_event_loop()
     def _run():
         cmd = [
-            "ffmpeg", "-y",
+            "ffmpeg","-y",
             "-headers", f"User-Agent: {CHROME_UA}\r\n",
-            "-allowed_extensions", "ALL",
-            "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-            "-i", url, "-c", "copy", "-movflags", "+faststart", out_file
+            "-allowed_extensions","ALL",
+            "-protocol_whitelist","file,http,https,tcp,tls,crypto",
+            "-i",url,"-c","copy","-movflags","+faststart",out_file
         ]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
-                raise RuntimeError(f"ffmpeg error: {r.stderr[-200:]}")
+                raise RuntimeError(f"ffmpeg: {r.stderr[-200:]}")
             if not os.path.exists(out_file) or os.path.getsize(out_file) < 1000:
                 raise RuntimeError("Output file empty")
             return out_file
         except subprocess.TimeoutExpired:
-            raise RuntimeError("⏱ Stream timed out (5 min limit).")
+            raise RuntimeError("⏱ Stream timed out (5 min).")
     try:
         result = await asyncio.wait_for(loop.run_in_executor(None, _run), timeout=310)
         return result, None
@@ -449,17 +713,16 @@ async def download_gdrive_folder(url, out_dir, progress_hook=None) -> tuple:
     import yt_dlp
     os.makedirs(out_dir, exist_ok=True)
     opts = {
-        "format": "best",
-        "outtmpl": os.path.join(out_dir, "%(title).80s.%(ext)s"),
-        "quiet": True, "no_warnings": True, "noplaylist": False,
-        "retries": 3, "http_headers": {"User-Agent": CHROME_UA},
+        "format":"best","outtmpl":os.path.join(out_dir,"%(title).80s.%(ext)s"),
+        "quiet":True,"no_warnings":True,"noplaylist":False,
+        "retries":3,"http_headers":{"User-Agent":CHROME_UA},
     }
     if progress_hook: opts["progress_hooks"] = [progress_hook]
     loop = asyncio.get_event_loop()
     def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-        skip = {".part", ".ytdl", ".tmp"}
+        skip = {".part",".ytdl",".tmp"}
         files = sorted([
             os.path.join(out_dir, x) for x in os.listdir(out_dir)
             if os.path.isfile(os.path.join(out_dir, x))
@@ -477,19 +740,19 @@ def download_thumb_from_url(thumb_url, video_id) -> Optional[str]:
         r = req.get(thumb_url, headers={"User-Agent": CHROME_UA}, timeout=10)
         if r.status_code == 200 and len(r.content) > 500:
             p = f"/tmp/thumb_{video_id}.jpg"
-            with open(p, "wb") as f: f.write(r.content)
+            with open(p,"wb") as f: f.write(r.content)
             return p
     except Exception: pass
     return None
 
 def find_thumbnail(base_path) -> Optional[str]:
-    for ext in (".jpg", ".jpeg", ".webp", ".png"):
-        t = base_path.rsplit(".", 1)[0] + ext
+    for ext in (".jpg",".jpeg",".webp",".png"):
+        t = base_path.rsplit(".",1)[0] + ext
         if os.path.exists(t) and os.path.getsize(t) > 500:
             if not t.endswith(".jpg"):
-                jpg = t.rsplit(".", 1)[0] + ".jpg"
+                jpg = t.rsplit(".",1)[0] + ".jpg"
                 r = subprocess.run(["ffmpeg","-y","-i",t,jpg], capture_output=True)
-                if r.returncode == 0 and os.path.exists(jpg):
+                if r.returncode==0 and os.path.exists(jpg):
                     try: os.remove(t)
                     except: pass
                     return jpg
@@ -497,7 +760,7 @@ def find_thumbnail(base_path) -> Optional[str]:
     return None
 
 async def generate_thumbnail(video_path) -> Optional[str]:
-    thumb_path = video_path.rsplit(".", 1)[0] + "_thumb.jpg"
+    thumb_path = video_path.rsplit(".",1)[0] + "_thumb.jpg"
     loop = asyncio.get_event_loop()
     def _run():
         duration = 0
@@ -518,7 +781,7 @@ async def generate_thumbnail(video_path) -> Optional[str]:
     return await loop.run_in_executor(None, _run)
 
 async def remux_to_mp4(input_path) -> str:
-    out = input_path.rsplit(".", 1)[0] + "_tg.mp4"
+    out = input_path.rsplit(".",1)[0] + "_tg.mp4"
     loop = asyncio.get_event_loop()
     def _run():
         r = subprocess.run(
