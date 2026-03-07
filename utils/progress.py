@@ -1,119 +1,88 @@
-"""
-Serena Bot - Progress Bar
-Shows title + action + animated bar + stats
-"""
-import asyncio, time
-from typing import Optional
-from pyrogram.types import Message
-from pyrogram.errors import FloodWait, MessageNotModified
+import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-def _bar(pct: float, length: int = 16) -> str:
-    filled = int(length * pct / 100)
-    return "▓" * filled + "░" * (length - filled)
+class Progress:
+    def __init__(self):
+        self.last_update_time = 0
+        self.update_interval = 5  # seconds
 
-def _sz(b: int) -> str:
-    if b <= 0: return "0 B"
-    for u in ("B","KB","MB","GB"):
-        if b < 1024: return f"{b:.1f} {u}"
-        b /= 1024
-    return f"{b:.1f} TB"
+    def generate_progress_bar(self, current: int, total: int, length: int = 15) -> str:
+        if total == 0:
+            return "░" * length
+        pct     = current / total
+        filled  = int(length * pct)
+        empty   = length - filled
+        return "▓" * filled + "░" * empty
 
-def _eta(secs: int) -> str:
-    if secs <= 0: return "∞"
-    if secs < 60: return f"{secs}s"
-    if secs < 3600: return f"{secs//60}m {secs%60}s"
-    return f"{secs//3600}h {(secs%3600)//60}m"
+    def format_size(self, size_bytes: int) -> str:
+        if size_bytes < 1024:         return f"{size_bytes} B"
+        elif size_bytes < 1024**2:    return f"{size_bytes/1024:.2f} KB"
+        elif size_bytes < 1024**3:    return f"{size_bytes/1024**2:.2f} MB"
+        else:                          return f"{size_bytes/1024**3:.2f} GB"
 
-def _spd(bps: float) -> str:
-    return _sz(int(bps)) + "/s"
+    def format_time(self, seconds: int) -> str:
+        if seconds < 0:    return "0s"
+        if seconds < 60:   return f"{int(seconds)}s"
+        elif seconds < 3600:
+            return f"{int(seconds//60)}m {int(seconds%60)}s"
+        h = int(seconds // 3600); m = int((seconds % 3600) // 60)
+        return f"{h}h {m}m"
 
-
-def build_bar(action: str, title: str, done: int, total: int,
-              speed: float, eta_s: int) -> str:
-    pct = min(done / total * 100, 100) if total > 0 else 0
-    icon = "⬇️" if "ownload" in action else "📤"
-    name = f"`{title[:35]}`" if title else ""
-    lines = [
-        f"{icon} **{action}** {name}",
-        f"`[{_bar(pct)}]` **{pct:.1f}%**",
-        f"┌ 📦 `{_sz(done)}` / `{_sz(total) if total else '?'}`",
-        f"├ 🚀 `{_spd(speed)}`",
-        f"└ ⏳ `{_eta(eta_s)}`",
-    ]
-    return "\n".join(lines)
-
-
-class ProgressTracker:
-    def __init__(self, message: Optional[Message], title: str = "",
-                 action: str = "Downloading", interval: float = 4.0):
-        self.message  = message
-        self.title    = title
-        self.action   = action
-        self.interval = interval
-        self._last_update = 0.0
-        self._last_done   = 0
-        self._last_time   = time.time()
-        self._speed       = 0.0
-
-    def _calc(self, done, total):
+    def should_update(self) -> bool:
         now = time.time()
-        if now - self._last_update < self.interval:
-            return None
-        elapsed = now - self._last_time
-        if elapsed > 0:
-            self._speed = (done - self._last_done) / elapsed
-        self._last_done   = done
-        self._last_time   = now
-        self._last_update = now
-        eta = int((total - done) / self._speed) if self._speed > 0 and total > done else 0
-        return eta
+        if now - self.last_update_time >= self.update_interval:
+            self.last_update_time = now
+            return True
+        return False
 
-    async def hook(self, done: int, total: int):
-        if not self.message: return
-        eta = self._calc(done, total)
-        if eta is None: return
-        await self._safe_edit(build_bar(self.action, self.title, done, total, self._speed, eta))
+    def get_download_progress_text(
+        self, filename: str, current: int, total: int, speed: float, eta: int
+    ) -> str:
+        pct = (current / total * 100) if total > 0 else 0
+        bar = self.generate_progress_bar(current, total)
+        name = filename[:45] + ("..." if len(filename) > 45 else "")
+        lines = [
+            f"⬇️ Downloading `{name}`",
+            f"[{bar}] {pct:.1f}%",
+            f"┌ 📦 {self.format_size(current)} / {self.format_size(total)}",
+            f"├ 🚀 {self.format_size(int(speed))}/s",
+            f"└ ⏳ {self.format_time(eta)}",
+        ]
+        return "\n".join(lines)
 
-    async def uploading(self, done: int, total: int):
-        if not self.message: return
-        eta = self._calc(done, total)
-        if eta is None: return
-        await self._safe_edit(build_bar("Uploading", self.title, done, total, self._speed, eta))
+    def get_upload_progress_text(
+        self, filename: str, current: int, total: int, speed: float, eta: int
+    ) -> str:
+        pct = (current / total * 100) if total > 0 else 0
+        bar = self.generate_progress_bar(current, total)
+        name = filename[:45] + ("..." if len(filename) > 45 else "")
+        lines = [
+            f"📤 Uploading `{name}`",
+            f"[{bar}] {pct:.1f}%",
+            f"┌ 📦 {self.format_size(current)} / {self.format_size(total)}",
+            f"├ 🚀 {self.format_size(int(speed))}/s",
+            f"└ ⏳ {self.format_time(eta)}",
+        ]
+        return "\n".join(lines)
 
-    async def _safe_edit(self, text: str):
-        for _ in range(3):
-            try:
-                await self.message.edit_text(text)
-                return
-            except FloodWait as e:
-                await asyncio.sleep(e.value + 1)
-            except (MessageNotModified, Exception):
-                return
+    def get_queue_status_text(self, current: int, total: int, filename: str) -> str:
+        return f"📊 **Task Progress:** {current}/{total}\n📁 **Current:** `{filename}`"
 
 
-class YtdlpProgressHook:
-    def __init__(self, tracker: Optional[ProgressTracker],
-                 loop: asyncio.AbstractEventLoop):
-        self.tracker    = tracker
-        self.loop       = loop
-        self._last_post = 0.0
-
-    def __call__(self, d: dict):
-        if not self.tracker: return
-        now = time.time()
-        if now - self._last_post < self.tracker.interval: return
-        self._last_post = now
-        if d.get("status") == "downloading":
-            done  = d.get("downloaded_bytes", 0)
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            speed = d.get("speed") or 0.0
-            eta   = d.get("eta") or 0
-            # update title from info if available
-            info = d.get("info_dict", {})
-            if info.get("title") and not self.tracker.title:
-                self.tracker.title = info["title"][:35]
-            text = build_bar("Downloading", self.tracker.title, done, total, speed, eta)
-            asyncio.run_coroutine_threadsafe(
-                self.tracker._safe_edit(text), self.loop
-            )
+async def progress_callback(current, total, message, progress_obj, start_time, filename, is_upload=False):
+    try:
+        if not progress_obj.should_update():
+            return
+        elapsed = time.time() - start_time
+        speed   = current / elapsed if elapsed > 0 else 0
+        eta     = int((total - current) / speed) if speed > 0 else 0
+        if is_upload:
+            text = progress_obj.get_upload_progress_text(filename, current, total, speed, eta)
+        else:
+            text = progress_obj.get_download_progress_text(filename, current, total, speed, eta)
+        await message.edit_text(text)
+    except Exception as e:
+        logger.debug(f"Progress update error: {e}")
