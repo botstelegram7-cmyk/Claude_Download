@@ -178,12 +178,14 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
 
     # ── Strategy order: embed clients FIRST ──────────────────────────────
     # web_embedded & tv_embedded = same clients Telegram uses for inline embed
-    # These have ZERO bot detection on most datacenter IPs
+    # These bypass bot detection AND age-restriction (error 152) on most IPs
     strategies = [
-        # Tier 1: Embed clients (bypass bot check completely)
+        # Tier 1: Embed clients — bypass bot check + age-restriction
         _make(["web_embedded"]),
         _make(["tv_embedded"]),
         _make(["web_embedded", "tv_embedded"]),
+        # Tier 1b: Age-bypass — use embed with cookies (best combo for error 152)
+        _make(["tv_embedded", "web_embedded"]),
         # Tier 2: Mobile clients
         _make(["android"], {"youtube": {"player_client": ["android"],
                                          "player_skip": ["webpage","configs"]}}),

@@ -318,13 +318,34 @@ async def _upload_single(client, message, fp, meta, user_id,
     cap       = _make_caption(url, orig_name, meta, file_size, platform)
     up_cb     = _upload_cb(tracker)
 
-    # Update tracker title from meta
     if tracker and meta:
         tracker.title = (meta.get("title") or "")[:35]
 
-    if ext in VIDEO_EXTS:
+    # Smart video detection: ext + meta vcodec + ffprobe fallback
+    is_video = ext in VIDEO_EXTS
+    if not is_video and meta:
+        if (meta.get("ext","").lower() in VIDEO_EXTS or
+            (meta.get("vcodec") and meta.get("vcodec") != "none")):
+            is_video = True
+    # ffprobe fallback: detect video stream even without recognized ext
+    if not is_video and ext not in AUDIO_EXTS and ext not in IMAGE_EXTS:
+        try:
+            import subprocess as _sp, json as _json
+            r = _sp.run(
+                ["ffprobe","-v","quiet","-print_format","json",
+                 "-show_streams","-select_streams","v:0", fp],
+                capture_output=True, text=True, timeout=8
+            )
+            if r.returncode == 0 and _json.loads(r.stdout).get("streams"):
+                is_video = True
+        except Exception:
+            pass
+
+    if is_video:
         if status_msg: await _safe_edit(status_msg, "🔄 **Preparing video...**")
-        fp = await remux_to_mp4(fp)  # faststart → Telegram inline playback
+        remuxed = await remux_to_mp4(fp)
+        if os.path.exists(remuxed) and os.path.getsize(remuxed) > 1000:
+            fp = remuxed
 
         thumb = None
         if meta:
@@ -345,7 +366,7 @@ async def _upload_single(client, message, fp, meta, user_id,
             video=fp,
             thumb=thumb,
             caption=cap,
-            supports_streaming=True,     # ← Telegram inline playback
+            supports_streaming=True,
             width=vi["width"] or None,
             height=vi["height"] or None,
             duration=vi["duration"] or None,
