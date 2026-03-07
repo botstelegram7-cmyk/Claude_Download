@@ -1,7 +1,12 @@
 """
-Serena Downloader Bot - Download Handler
+Serena Bot - Download Handler
+- Quality selector only for YouTube
+- Pin message on queue start, reply to pin for delivery
+- Queue delay between jobs
+- Encrypted M3U8 support
+- Metadata caption: platform name, no source URL
 """
-import os, sys, asyncio
+import os, sys, asyncio, re
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
@@ -9,14 +14,17 @@ if _root not in sys.path:
 
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from pyrogram.errors import FloodWait
+from pyrogram.enums import ChatType
 import database as db
 from utils.decorators import not_banned, ensure_registered
-from utils.helpers import is_valid_url, detect_url_type, BULLET
+from utils.helpers import is_valid_url, detect_url_type
 from queue_manager import queue_manager, DownloadJob
 from downloader.media import process_download, handle_gdrive_choice
-from config import PLANS, OWNER_IDS
+from config import PLANS, OWNER_IDS, QUEUE_DELAY
 import config as _cfg
+
+B = "▸"
+LN = "─" * 22
 
 _pending_urls: dict = {}
 
@@ -26,6 +34,26 @@ _CMDS = [
     "givepremium","removepremium","ban","unban","broadcast","stats","users",
     "banned","restart","lock","unlock"
 ]
+
+# Platforms that support quality selection
+_QUALITY_PLATFORMS = {"youtube"}
+
+# Platform display names for caption
+_PLATFORM_NAMES = {
+    "youtube":      "YouTube",
+    "instagram":    "Instagram",
+    "tiktok":       "TikTok",
+    "twitter":      "Twitter/X",
+    "facebook":     "Facebook",
+    "gdrive":       "Google Drive",
+    "terabox":      "Terabox",
+    "m3u8":         "Stream",
+    "direct_video": "Direct Link",
+    "direct_audio": "Direct Link",
+    "direct_image": "Direct Link",
+    "direct_doc":   "Direct Link",
+    "generic":      "Unknown",
+}
 
 
 async def _guard(message: Message, user_id: int) -> bool:
@@ -39,17 +67,20 @@ async def _guard(message: Message, user_id: int) -> bool:
         await message.reply_text("❌ Please /start first.")
         return False
     if user.get("is_banned"):
-        await message.reply_text("🚫 You are banned. Contact @TechnicalSerena.")
+        await message.reply_text("🚫 You are banned.")
         return False
     if user_id in OWNER_IDS:
         return True
-    plan = user.get("plan","free")
+    plan  = user.get("plan","free")
     limit = PLANS.get(plan, PLANS["free"])["limit"]
-    if user.get("daily_count", 0) >= limit:
+    used  = user.get("daily_count",0)
+    if used >= limit:
+        pi = PLANS.get(plan, PLANS["free"])
         await message.reply_text(
             f"⚠️ **Daily limit reached!**\n\n"
-            f"{BULLET} Limit: `{limit}` downloads/day\n"
-            f"{BULLET} Upgrade: @TechnicalSerena"
+            f"{B} Plan: `{pi['name']}`\n"
+            f"{B} Limit: `{limit}` downloads/day\n\n"
+            f"Contact @TechnicalSerena to upgrade 💎"
         )
         return False
     return True
@@ -63,17 +94,39 @@ def _quality_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("1080p",    callback_data="dl_q:1080p"),
          InlineKeyboardButton("🎵 Audio", callback_data="dl_q:audio"),
          InlineKeyboardButton("✨ Best",  callback_data="dl_q:best")],
-        [InlineKeyboardButton("❌ Cancel",callback_data="dl_q:cancel")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="dl_q:cancel")],
     ])
 
 
-async def _try_pin(client, chat_id, msg_id):
+async def _pin_and_reply(client, message, status_msg):
+    """Pin the user's original message, then reply to pin for file delivery."""
+    pinned_msg = None
     try:
-        from pyrogram.enums import ChatType
-        await client.pin_chat_message(chat_id, msg_id, disable_notification=True)
+        if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            await client.pin_chat_message(
+                message.chat.id, message.id, disable_notification=True
+            )
+            pinned_msg = message
     except Exception:
         pass
+    return pinned_msg
 
+
+async def _start_download(client, orig_msg, url, quality, audio_only, status_msg):
+    """Run download with queue delay, reply to pinned message."""
+    await asyncio.sleep(QUEUE_DELAY)
+    await process_download(
+        client=client,
+        message=orig_msg,
+        url=url,
+        quality=quality,
+        audio_only=audio_only,
+        status_msg=status_msg,
+        platform=_PLATFORM_NAMES.get(detect_url_type(url), "Unknown"),
+    )
+
+
+# ── URL handler ───────────────────────────────────────────────────────────────
 
 @Client.on_message(
     filters.text & ~filters.outgoing & ~filters.command(_CMDS),
@@ -88,23 +141,32 @@ async def handle_url(client: Client, message: Message):
     user_id = message.from_user.id
     if not await _guard(message, user_id):
         return
-    _pending_urls[user_id] = text
+
     url_type = detect_url_type(text)
-    labels = {
-        "youtube":"YouTube 🎬","instagram":"Instagram 📸","tiktok":"TikTok 🎵",
-        "twitter":"Twitter/X 🐦","facebook":"Facebook 👥","gdrive":"Google Drive 📁",
-        "terabox":"Terabox ☁️","m3u8":"M3U8 Stream 📡","direct_video":"Direct Video 🎬",
-        "direct_audio":"Direct Audio 🎵","direct_image":"Direct Image 🖼️",
-        "direct_doc":"Direct Document 📄","generic":"Media 🌐",
+    _pending_urls[user_id] = text
+
+    platform_labels = {
+        "youtube":      "YouTube 🎬",
+        "instagram":    "Instagram 📸",
+        "tiktok":       "TikTok 🎵",
+        "twitter":      "Twitter/X 🐦",
+        "facebook":     "Facebook 👥",
+        "gdrive":       "Google Drive 📁",
+        "terabox":      "Terabox ☁️",
+        "m3u8":         "Stream 📡",
+        "direct_video": "Direct Video 🎬",
+        "direct_audio": "Direct Audio 🎵",
+        "direct_image": "Direct Image 🖼️",
+        "direct_doc":   "Direct File 📄",
+        "generic":      "Media 🌐",
     }
-    label = labels.get(url_type, "Media 🌐")
+    label = platform_labels.get(url_type, "Media 🌐")
     short = text[:55] + "..." if len(text) > 55 else text
 
-    # Google Drive folder — show ZIP/individual choice immediately
+    # Google Drive folder
     if url_type == "gdrive" and "/drive/folders/" in text:
-        sm = await message.reply_text(
-            f"📁 **{label} detected!**\n\n{BULLET} `{short}`\n\n"
-            f"**How to receive files?**",
+        await message.reply_text(
+            f"📁 **{label} detected!**\n\n{B} `{short}`\n\n**How to receive files?**",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📦 ZIP Archive",      callback_data="dl_gdrive:zip"),
                  InlineKeyboardButton("📂 Individual Files", callback_data="dl_gdrive:individual")],
@@ -113,66 +175,40 @@ async def handle_url(client: Client, message: Message):
         )
         return
 
-    await message.reply_text(
-        f"🔍 **{label} detected!**\n\n{BULLET} `{short}`\n\n⚡ Select quality:",
-        reply_markup=_quality_kb()
-    )
-
-
-# ── Google Drive folder callback ──
-@Client.on_callback_query(filters.regex(r"^dl_gdrive:"))
-async def gdrive_choice_cb(client: Client, query: CallbackQuery):
-    await query.answer()
-    choice = query.data.split(":",1)[1]
-    user_id = query.from_user.id
-
-    if choice == "cancel":
-        _pending_urls.pop(user_id, None)
-        try: await query.message.edit_text("❌ Cancelled.")
-        except: pass
-        return
-
-    url = _pending_urls.pop(user_id, None)
-    if not url:
-        try: await query.message.edit_text("⚠️ Session expired. Resend the URL.")
-        except: pass
-        return
-
-    if not await _guard(query.message, user_id):
-        return
-
-    try:
-        status_msg = await query.message.edit_text(
-            f"⏳ **Queuing Google Drive download...**\n{BULLET} Mode: `{choice}`"
+    # YouTube — show quality selector
+    if url_type in _QUALITY_PLATFORMS:
+        await message.reply_text(
+            f"🔍 **{label} detected!**\n\n{B} `{short}`\n\n⚡ **Choose quality:**",
+            reply_markup=_quality_kb()
         )
-    except Exception:
-        status_msg = await query.message.reply_text("⏳ Queuing...")
+        return
 
-    _sm = status_msg
-    _url = url
-    _choice = choice
+    # All other platforms — download immediately at best quality
+    sm = await message.reply_text(f"⏳ **Queuing {label} download...**")
+    await _pin_and_reply(client, message, sm)
 
-    job = DownloadJob(user_id=user_id, url=url, quality="best", msg_id=status_msg.id)
+    job = DownloadJob(user_id=user_id, url=text, quality="best", msg_id=sm.id)
+    _sm = sm
+    _msg = message
+    _url = text
 
-    async def handler(j: DownloadJob):
-        await process_download(
-            client=client, message=query.message,
-            url=j.url, quality="best",
-            status_msg=_sm
-        )
+    async def handler(j):
+        await _start_download(client, _msg, j.url, "best", False, _sm)
 
     pos = await queue_manager.enqueue(job, handler)
     try:
-        await status_msg.edit_text(
+        await sm.edit_text(
             f"📋 **Queued!**\n\n"
-            f"{BULLET} Position: `#{pos}`\n"
-            f"{BULLET} Mode: `{'ZIP Archive' if choice == 'zip' else 'Individual Files'}`"
+            f"{B} Platform: `{label}`\n"
+            f"{B} Position: `#{pos}`\n"
+            f"{B} URL: `{_url[:50]}`"
         )
     except Exception:
         pass
 
 
-# ── Quality callback ──
+# ── Quality callback ──────────────────────────────────────────────────────────
+
 @Client.on_callback_query(filters.regex(r"^dl_q:"))
 async def quality_cb(client: Client, query: CallbackQuery):
     await query.answer()
@@ -196,48 +232,97 @@ async def quality_cb(client: Client, query: CallbackQuery):
 
     audio_only = (quality == "audio")
     try:
-        status_msg = await query.message.edit_text(
-            f"⏳ **Queuing...**\n{BULLET} Quality: `{quality}`"
+        sm = await query.message.edit_text(
+            f"⏳ **Queuing...**\n{B} Quality: `{quality}`"
         )
     except Exception:
-        status_msg = await query.message.reply_text("⏳ Queuing...")
+        sm = await query.message.reply_text("⏳ Queuing...")
 
-    job = DownloadJob(user_id=user_id, url=url, quality=quality,
-                     audio_only=audio_only, msg_id=status_msg.id)
-    _sm = status_msg
-    _orig = query.message
+    await _pin_and_reply(client, query.message, sm)
 
-    async def handler(j: DownloadJob):
-        await process_download(
-            client=client, message=_orig,
-            url=j.url, quality=j.quality,
-            audio_only=j.audio_only, status_msg=_sm
-        )
-        try:
-            from pyrogram.enums import ChatType
-            if _orig.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-                await _try_pin(client, _orig.chat.id, _orig.id)
-        except Exception:
-            pass
+    job  = DownloadJob(user_id=user_id, url=url, quality=quality,
+                      audio_only=audio_only, msg_id=sm.id)
+    _sm  = sm
+    _msg = query.message
+    _url = url
+    _q   = quality
+    _ao  = audio_only
+
+    async def handler(j):
+        await _start_download(client, _msg, j.url, _q, _ao, _sm)
 
     pos = await queue_manager.enqueue(job, handler)
     try:
-        await status_msg.edit_text(
+        await sm.edit_text(
             f"📋 **Added to queue!**\n\n"
-            f"{BULLET} Position: `#{pos}`\n"
-            f"{BULLET} Quality: `{quality}`\n"
-            f"{BULLET} URL: `{url[:50]}`"
+            f"{B} Position: `#{pos}`\n"
+            f"{B} Quality: `{quality}`\n"
+            f"{B} URL: `{url[:50]}`"
         )
     except Exception:
         pass
 
 
-# ── Google Drive ZIP/Individual callback (from media.py pending) ──
+# ── Google Drive callbacks ─────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^dl_gdrive:"))
+async def gdrive_choice_cb(client: Client, query: CallbackQuery):
+    await query.answer()
+    choice  = query.data.split(":",1)[1]
+    user_id = query.from_user.id
+
+    if choice == "cancel":
+        _pending_urls.pop(user_id, None)
+        try: await query.message.edit_text("❌ Cancelled.")
+        except: pass
+        return
+
+    url = _pending_urls.pop(user_id, None)
+    if not url:
+        try: await query.message.edit_text("⚠️ Session expired.")
+        except: pass
+        return
+
+    if not await _guard(query.message, user_id):
+        return
+
+    try:
+        sm = await query.message.edit_text(
+            f"⏳ **Queuing Drive download...**\n{B} Mode: `{choice}`"
+        )
+    except Exception:
+        sm = await query.message.reply_text("⏳ Queuing...")
+
+    _sm   = sm
+    _msg  = query.message
+    _url  = url
+
+    job = DownloadJob(user_id=user_id, url=_url, quality="best", msg_id=sm.id)
+
+    async def handler(j):
+        await asyncio.sleep(QUEUE_DELAY)
+        await process_download(client=client, message=_msg, url=j.url,
+                               quality="best", status_msg=_sm,
+                               platform="Google Drive")
+
+    pos = await queue_manager.enqueue(job, handler)
+    try:
+        await sm.edit_text(
+            f"📋 **Queued!**\n\n"
+            f"{B} Position: `#{pos}`\n"
+            f"{B} Mode: `{'ZIP Archive' if choice == 'zip' else 'Individual Files'}`"
+        )
+    except Exception:
+        pass
+
+
 @Client.on_callback_query(filters.regex(r"^gdrive_(zip|individual)$"))
 async def gdrive_receive_cb(client: Client, query: CallbackQuery):
     choice = "zip" if "zip" in query.data else "individual"
     await handle_gdrive_choice(client, query, choice)
 
+
+# ── /audio ────────────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("audio") & ~filters.outgoing)
 @ensure_registered
@@ -245,7 +330,11 @@ async def gdrive_receive_cb(client: Client, query: CallbackQuery):
 async def audio_cmd(client: Client, message: Message):
     url = " ".join(message.command[1:]).strip()
     if not url or not is_valid_url(url):
-        await message.reply_text("🎵 Usage: `/audio [URL]`")
+        await message.reply_text(
+            f"🎵 **Usage:** `/audio [URL]`\n\n"
+            f"**Example:** `/audio https://youtu.be/abc123`\n\n"
+            f"Extracts audio as MP3 from any supported platform."
+        )
         return
     user_id = message.from_user.id
     if not await _guard(message, user_id):
@@ -254,11 +343,16 @@ async def audio_cmd(client: Client, message: Message):
     job = DownloadJob(user_id=user_id, url=url, quality="audio", audio_only=True, msg_id=sm.id)
     _sm = sm
     async def handler(j):
-        await process_download(client, message, j.url, quality="audio", audio_only=True, status_msg=_sm)
+        await asyncio.sleep(QUEUE_DELAY)
+        await process_download(client, message, j.url, quality="audio",
+                               audio_only=True, status_msg=_sm,
+                               platform=_PLATFORM_NAMES.get(detect_url_type(j.url),"Unknown"))
     pos = await queue_manager.enqueue(job, handler)
-    try: await sm.edit_text(f"📋 Queue `#{pos}` — 🎵 Audio queued!")
+    try: await sm.edit_text(f"📋 Queue `#{pos}` — 🎵 Audio extraction queued!")
     except: pass
 
+
+# ── /info ─────────────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("info") & ~filters.outgoing)
 @ensure_registered
@@ -267,9 +361,13 @@ async def info_cmd(client: Client, message: Message):
     import yt_dlp
     url = " ".join(message.command[1:]).strip()
     if not url or not is_valid_url(url):
-        await message.reply_text("ℹ️ Usage: `/info [URL]`")
+        await message.reply_text(
+            f"ℹ️ **Usage:** `/info [URL]`\n\n"
+            f"**Example:** `/info https://youtu.be/abc123`\n\n"
+            f"Shows title, duration, views before downloading."
+        )
         return
-    msg = await message.reply_text("🔍 **Fetching media info...**")
+    msg = await message.reply_text("🔍 Fetching info...")
     try:
         loop = asyncio.get_event_loop()
         def _extract():
@@ -287,13 +385,13 @@ async def info_cmd(client: Client, message: Message):
         likes    = info.get("like_count",0)
         ext      = info.get("ext","?")
         await msg.edit_text(
-            f"⋆｡° ✮ °｡⋆\n**Media Info** ℹ️\n»»──── ✦ ────««\n\n"
-            f"{BULLET} **Title:** `{title}`\n"
-            f"{BULLET} **Duration:** `{fmt_duration(int(duration)) if duration else 'N/A'}`\n"
-            f"{BULLET} **Uploader:** `{uploader}`\n"
-            f"{BULLET} **Views:** `{views:,}`\n"
-            f"{BULLET} **Likes:** `{likes:,}`\n"
-            f"{BULLET} **Format:** `{ext}`\n\n⋆ ｡˚ ˚｡ ⋆",
+            f"**✦ Media Info ✦**\n`{LN}`\n\n"
+            f"{B} **Title:** `{title}`\n"
+            f"{B} **Duration:** `{fmt_duration(int(duration)) if duration else 'N/A'}`\n"
+            f"{B} **Uploader:** `{uploader}`\n"
+            f"{B} **Views:** `{views:,}`\n"
+            f"{B} **Likes:** `{likes:,}`\n"
+            f"{B} **Format:** `{ext}`\n\n`{LN}`",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("⬇️ Download", callback_data=f"info_dl:{url[:80]}")
             ]])
@@ -306,25 +404,41 @@ async def info_cmd(client: Client, message: Message):
 @Client.on_callback_query(filters.regex(r"^info_dl:"))
 async def info_dl_cb(client: Client, query: CallbackQuery):
     await query.answer()
-    url = query.data.split(":",1)[1]
+    url     = query.data.split(":",1)[1]
     user_id = query.from_user.id
     if not await _guard(query.message, user_id):
         return
     _pending_urls[user_id] = url
-    try:
-        await query.message.edit_text(
-            f"🔍 **URL loaded!**\n\n{BULLET} `{url[:55]}`\n\n⚡ Select quality:",
-            reply_markup=_quality_kb()
-        )
-    except Exception:
-        pass
+    url_type = detect_url_type(url)
+    if url_type in _QUALITY_PLATFORMS:
+        try:
+            await query.message.edit_text(
+                f"⚡ **Choose quality:**",
+                reply_markup=_quality_kb()
+            )
+        except Exception:
+            pass
+    else:
+        # Direct download
+        sm = await query.message.edit_text("⏳ Queuing...")
+        job = DownloadJob(user_id=user_id, url=url, quality="best", msg_id=sm.id)
+        _sm = sm; _msg = query.message
+        async def handler(j):
+            await _start_download(client, _msg, j.url, "best", False, _sm)
+        pos = await queue_manager.enqueue(job, handler)
+        try: await sm.edit_text(f"📋 Queue `#{pos}` — Downloading...")
+        except: pass
 
+
+# ── /cancel ───────────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("cancel") & ~filters.outgoing)
 async def cancel_cmd(client: Client, message: Message):
     _pending_urls.pop(message.from_user.id, None)
     await message.reply_text("❌ **Cancelled.**")
 
+
+# ── Bulk .txt ─────────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.document & ~filters.outgoing, group=1)
 @ensure_registered
@@ -336,23 +450,26 @@ async def handle_txt(client: Client, message: Message):
     user_id = message.from_user.id
     if not await _guard(message, user_id):
         return
-    sm = await message.reply_text("📄 **Processing bulk URL file...**")
+    sm = await message.reply_text("📄 Processing URL file...")
     try:
         path = await client.download_media(message, file_name=f"/tmp/{user_id}_bulk.txt")
         with open(path) as f:
-            lines = [l.strip() for l in f if l.strip() and not l.startswith("#") and is_valid_url(l.strip())]
+            lines = [l.strip() for l in f
+                     if l.strip() and not l.startswith("#") and is_valid_url(l.strip())]
         os.remove(path)
         if not lines:
-            await sm.edit_text("❌ No valid URLs found.")
+            await sm.edit_text("❌ No valid URLs found in file.")
             return
-        await sm.edit_text(f"📋 **{len(lines)} URLs found!** Queueing all...")
+        await sm.edit_text(f"📋 **{len(lines)} URLs found!** Queueing...")
         for i, url in enumerate(lines, 1):
-            s = await message.reply_text(f"⏳ `[{i}/{len(lines)}]` Queuing...")
+            s = await message.reply_text(f"⏳ `[{i}/{len(lines)}]` Queuing `{url[:40]}`...")
             job = DownloadJob(user_id=user_id, url=url, quality="best", msg_id=s.id)
-            _s = s
-            async def make_h(_s=_s):
+            _s = s; _u = url
+            async def make_h(_s=_s, _u=_u):
                 async def h(j):
-                    await process_download(client, message, j.url, status_msg=_s)
+                    await asyncio.sleep(QUEUE_DELAY)
+                    await process_download(client, message, j.url, status_msg=_s,
+                                           platform=_PLATFORM_NAMES.get(detect_url_type(j.url),"Unknown"))
                 return h
             await queue_manager.enqueue(job, await make_h())
             await asyncio.sleep(0.3)
