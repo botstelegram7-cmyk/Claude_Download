@@ -447,24 +447,280 @@ async def _scrape_video_host(url: str, out_dir: str, hook) -> tuple:
 
 
 # ── Terabox ───────────────────────────────────────────────────────────────
-async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
-    import yt_dlp
-    from config import YT_PROXY
+# Third-party APIs (no cookies needed — same as terabox bot)
+_TERABOX_THIRD_PARTY_APIS = [
+    "https://teraboxdownloader.online/api/download?url=",
+    "https://terabox.udayscriptsx.workers.dev/?url=",
+    "https://tera.instavideosave.com/?url=",
+    "https://teradl-api.dapuntaratya.com/generate?url=",
+]
 
+_TERABOX_DOMAINS_API = [
+    "https://www.terabox.com",
+    "https://www.1024tera.com",
+    "https://teraboxapp.com",
+]
+
+
+def _extract_terabox_surl(url: str) -> Optional[str]:
+    """Extract surl from any Terabox URL format"""
+    patterns = [
+        r'[?&]surl=([a-zA-Z0-9_-]+)',
+        r'/s/1?([a-zA-Z0-9_-]+)',
+        r'tbx\.to/([a-zA-Z0-9_-]+)',
+        r'/sharing/(?:link|video)\?surl=([a-zA-Z0-9_-]+)',
+        r'/wap/share/filelist\?surl=([a-zA-Z0-9_-]+)',
+    ]
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m: return m.group(1)
+    return None
+
+
+def _normalize_terabox_url(url: str) -> str:
+    """Normalize any Terabox URL to standard format"""
+    surl = _extract_terabox_surl(url)
+    if surl:
+        clean = surl.lstrip("1") if len(surl) > 20 else surl
+        return f"https://www.terabox.com/s/1{clean}"
+    return url
+
+
+def _terabox_third_party(url: str) -> tuple:
+    """Try free third-party APIs to get direct download link"""
+    import requests as req
+    from urllib.parse import quote
+    normalized = _normalize_terabox_url(url)
+    for api in _TERABOX_THIRD_PARTY_APIS:
+        try:
+            api_url = api + quote(normalized, safe="")
+            r = req.get(api_url, timeout=20)
+            if r.status_code != 200: continue
+            ct = r.headers.get("Content-Type","")
+            data = r.json() if "json" in ct else {}
+            dl_url = (
+                data.get("download_link") or data.get("downloadLink") or
+                data.get("dlink") or data.get("url") or
+                (data.get("data") or {}).get("download_link") or
+                (data.get("data") or {}).get("dlink") or
+                (data.get("result") or {}).get("download_link")
+            )
+            filename = (
+                data.get("filename") or data.get("file_name") or
+                data.get("name") or
+                (data.get("data") or {}).get("filename") or
+                "terabox_file"
+            )
+            if dl_url and dl_url.startswith("http"):
+                return dl_url, clean_filename(filename)
+        except Exception:
+            continue
+    return None, None
+
+
+def _terabox_official_api(surl: str, cookie: str) -> tuple:
+    """Use official Terabox API with cookies"""
+    import requests as req
+    if not cookie: return None, None
+    headers = {
+        "User-Agent": CHROME_UA,
+        "Accept": "application/json",
+        "Cookie": cookie,
+        "Referer": "https://www.terabox.com/",
+    }
+    for base in _TERABOX_DOMAINS_API:
+        for prefix in ["1", ""]:
+            try:
+                api_url = f"{base}/api/shorturlinfo?shorturl={prefix}{surl}&root=1"
+                r = req.get(api_url, headers=headers, timeout=20)
+                if r.status_code != 200: continue
+                data = r.json()
+                if data.get("errno") == 0:
+                    file_list = data.get("list", [])
+                    if file_list:
+                        first = file_list[0]
+                        dlink = first.get("dlink","")
+                        fname = first.get("server_filename") or first.get("filename") or "terabox_file"
+                        if dlink: return dlink, clean_filename(fname)
+            except Exception:
+                continue
+    return None, None
+
+
+def _terabox_scrape(url: str, cookie: str = "") -> tuple:
+    """Scrape Terabox page for direct dlink"""
+    import requests as req
+    try:
+        headers = {"User-Agent": CHROME_UA, "Accept": "text/html"}
+        if cookie: headers["Cookie"] = cookie
+        normalized = _normalize_terabox_url(url)
+        r = req.get(normalized, headers=headers, timeout=20)
+        text = r.text
+        dlink = None
+        for pat in [r'"dlink"\s*:\s*"([^"]+)"', r'"downloadLink"\s*:\s*"([^"]+)"']:
+            m = re.search(pat, text)
+            if m:
+                candidate = m.group(1).replace("\/", "/").replace("\u0026", "&")
+                if candidate.startswith("http"):
+                    dlink = candidate; break
+        filename = "terabox_file"
+        for pat in [r'"server_filename"\s*:\s*"([^"]+)"', r'"filename"\s*:\s*"([^"]+)"']:
+            m = re.search(pat, text)
+            if m:
+                fname = m.group(1).strip()
+                if fname and len(fname) > 2:
+                    filename = clean_filename(fname); break
+        return dlink, filename
+    except Exception as e:
+        return None, "terabox_file"
+
+
+def _detect_file_type_magic(file_path: str) -> str:
+    """Detect real file type from magic bytes — same as terabox bot"""
+    try:
+        with open(file_path, "rb") as f:
+            h = f.read(32)
+        if b"ftyp" in h[:12]:                               return "mp4"
+        if h[:4] == b"\x1a\x45\xdf\xa3":               return "mkv"
+        if h[:4] == b"RIFF" and h[8:12] == b"AVI ":        return "avi"
+        if h[:3] == b"FLV":                                  return "flv"
+        if h[:3] == b"ID3" or h[:2] in [b"\xff\xfb", b"\xff\xfa"]: return "mp3"
+        if h[:4] == b"fLaC":                                 return "flac"
+        if h[:4] == b"RIFF" and h[8:12] == b"WAVE":         return "wav"
+        if h[:4] == b"OggS":                                 return "ogg"
+        if h[:2] == b"\xff\xd8":                          return "jpg"
+        if h[:8] == b"\x89PNG\r\n\x1a\n":              return "png"
+        if h[:6] in [b"GIF87a", b"GIF89a"]:                 return "gif"
+        if h[:4] == b"RIFF" and h[8:12] == b"WEBP":         return "webp"
+        if h[:4] == b"%PDF":                                 return "pdf"
+        if h[:4] == b"PK\x03\x04":                        return "zip"
+        if h[:6] == b"Rar!\x1a\x07":                      return "rar"
+        if b"<!DOCTYPE" in h or b"<html" in h.lower():       return "html"
+    except Exception:
+        pass
+    return ""
+
+
+async def _terabox_download_file(dl_url: str, filename: str, out_dir: str,
+                                  cookie: str, hook) -> tuple:
+    """Download the actual file from resolved Terabox direct URL"""
+    import aiohttp
+    os.makedirs(out_dir, exist_ok=True)
+    headers = {
+        "User-Agent": CHROME_UA,
+        "Referer": "https://www.terabox.com/",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+    }
+    if cookie: headers["Cookie"] = cookie
+
+    out_file = os.path.join(out_dir, filename)
+    async with aiohttp.ClientSession(headers=headers) as s:
+        async with s.get(dl_url, timeout=aiohttp.ClientTimeout(total=3600),
+                         allow_redirects=True) as resp:
+            resp.raise_for_status()
+            # Fix filename from Content-Disposition if available
+            cd = resp.headers.get("Content-Disposition","")
+            if cd:
+                m = re.search(r'filename[^;]*=([^;\r\n]+)', cd, re.I)
+                if m:
+                    from urllib.parse import unquote
+                    fname = unquote(m.group(1).strip().strip('"\' '))
+                    if fname: out_file = os.path.join(out_dir, clean_filename(fname))
+
+            total = int(resp.headers.get("Content-Length", 0))
+            done  = 0
+            with open(out_file, "wb") as f:
+                async for chunk in resp.content.iter_chunked(131072):
+                    f.write(chunk); done += len(chunk)
+                    if hook:
+                        try: await hook(done, total)
+                        except Exception: pass
+
+    # Fix extension from magic bytes
+    real_ext = _detect_file_type_magic(out_file)
+    if real_ext and real_ext != "html":
+        cur_ext = os.path.splitext(out_file)[1].lstrip(".").lower()
+        if not cur_ext or cur_ext != real_ext:
+            new_path = os.path.splitext(out_file)[0] + "." + real_ext
+            try:
+                os.rename(out_file, new_path)
+                out_file = new_path
+            except Exception:
+                pass
+    elif real_ext == "html":
+        os.remove(out_file)
+        raise RuntimeError("Got HTML error page — file unavailable or private.")
+
+    meta = {"title": clean_filename(os.path.splitext(os.path.basename(out_file))[0])
+                     .replace("_"," ").replace("-"," ").strip()}
+    return out_file, meta
+
+
+async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
+    """
+    Terabox download — 4 methods from terabox bot reference:
+    1. Third-party free APIs (no cookies)
+    2. Official Terabox API (with cookies)
+    3. Page scraping (dlink extraction)
+    4. yt-dlp fallback (with proxy)
+    """
+    from config import TERABOX_COOKIES, YT_PROXY
+    import yt_dlp
+
+    os.makedirs(out_dir, exist_ok=True)
+    cookie_str = ""
+    if TERABOX_COOKIES:
+        cookie_str = TERABOX_COOKIES.strip().strip('"').strip("'")
+
+    surl = _extract_terabox_surl(url)
+    loop = asyncio.get_event_loop()
+    last_err = ""
+
+    # ── Method 1: Third-party free APIs ────────────────────────────────────
+    try:
+        dl_url, filename = await loop.run_in_executor(None, _terabox_third_party, url)
+        if dl_url:
+            return await _terabox_download_file(dl_url, filename or "terabox_file.mp4",
+                                                 out_dir, cookie_str, hook)
+    except Exception as e:
+        last_err = f"API: {str(e)[:60]}"
+
+    # ── Method 2: Official API with cookies ────────────────────────────────
+    if surl and cookie_str:
+        try:
+            dl_url, filename = await loop.run_in_executor(
+                None, _terabox_official_api, surl, cookie_str
+            )
+            if dl_url:
+                return await _terabox_download_file(dl_url, filename or "terabox_file.mp4",
+                                                     out_dir, cookie_str, hook)
+        except Exception as e:
+            last_err += f" | OfficialAPI: {str(e)[:60]}"
+
+    # ── Method 3: Page scraping ─────────────────────────────────────────────
+    try:
+        dl_url, filename = await loop.run_in_executor(
+            None, _terabox_scrape, url, cookie_str
+        )
+        if dl_url:
+            return await _terabox_download_file(dl_url, filename or "terabox_file.mp4",
+                                                 out_dir, cookie_str, hook)
+    except Exception as e:
+        last_err += f" | Scrape: {str(e)[:60]}"
+
+    # ── Method 4: yt-dlp fallback ───────────────────────────────────────────
     base = {
         "format": "best[ext=mp4]/best",
         "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
         "merge_output_format": "mp4",
         "quiet": True, "no_warnings": True,
-        "writethumbnail": True, "postprocessors": [],
-        "retries": 3, "socket_timeout": 30,
+        "retries": 2, "socket_timeout": 25,
         "http_headers": {"User-Agent": CHROME_UA},
     }
     if cookie_file: base["cookiefile"] = cookie_file
     if hook: base["progress_hooks"] = [hook]
 
-    loop = asyncio.get_event_loop()
-    last_err = ""
     for opts in ([{**base,"proxy":YT_PROXY},base] if YT_PROXY else [base]):
         def _run(o=opts):
             with yt_dlp.YoutubeDL(o) as ydl:
@@ -479,11 +735,12 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
             result, meta = await loop.run_in_executor(None, _run)
             if result: return result, meta
         except Exception as e:
-            last_err = str(e); continue
+            last_err += f" | ytdlp: {str(e)[:60]}"; continue
 
     raise RuntimeError(
-        "⛔ **Terabox blocked this server IP.**\n"
-        "**Fix:** Delete Render → create new service (fresh IP)"
+        f"⛔ **Terabox download failed.**\n\n"
+        f"All 4 methods tried:\n"
+        f"`{last_err[:200]}`"
     )
 
 
@@ -589,10 +846,10 @@ async def download_direct(url: str, out_dir: str, filename: str = None,
             cd = resp.headers.get("Content-Disposition","")
             fname = None
             if cd:
-                m = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\r\n]+)', cd, re.I)
+                m = re.search(r'filename[^;]*=([^;\r\n]+)', cd, re.I)
                 if m:
                     from urllib.parse import unquote
-                    fname = unquote(m.group(1).strip().strip('"\''))
+                    fname = unquote(m.group(1).strip().strip('"\' '))
             if not fname:
                 from urllib.parse import unquote
                 raw = unquote(url.split("?")[0].rstrip("/").split("/")[-1])
