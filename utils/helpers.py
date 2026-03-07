@@ -1,8 +1,9 @@
 """
-Serena Downloader Bot - Helpers
+Serena Bot - Helpers
 """
 import os, sys, re, tempfile
 from typing import Optional
+from urllib.parse import unquote
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
@@ -18,10 +19,18 @@ DIVIDER = "»»──── ✦ ────««"
 FOOTER  = "⋆ ｡˚ ˚｡ ⋆"
 BULLET  = "▸"
 
+# All Terabox domains — checked in detect_url_type
+TERABOX_DOMAINS = [
+    "terabox.com", "1024terabox.com", "teraboxapp.com", "terabox.app",
+    "4funbox.com", "mirrobox.com", "nephobox.com", "freeterabox.com",
+    "momerybox.com", "tibibox.com", "teraboxlink.com", "terasharelink.com",
+    "www.terabox.com", "www.1024terabox.com",
+]
+
 
 def fmt_size(size_bytes: int) -> str:
     if size_bytes <= 0: return "0 B"
-    for unit in ("B","KB","MB","GB"):
+    for unit in ("B", "KB", "MB", "GB"):
         if size_bytes < 1024:
             return f"{size_bytes:.2f} {unit}"
         size_bytes /= 1024
@@ -31,15 +40,14 @@ _fmt_size = fmt_size
 
 
 def fmt_duration(seconds: int) -> str:
-    if seconds < 60:   return f"{seconds}s"
+    if seconds < 60:    return f"{seconds}s"
     elif seconds < 3600: return f"{seconds//60}m {seconds%60}s"
     else:
-        h = seconds//3600; m=(seconds%3600)//60
+        h = seconds // 3600; m = (seconds % 3600) // 60
         return f"{h}h {m}m"
 
 
 def _fix_cookie_content(content: str) -> str:
-    """Fix Render env vars: literal \\n -> real newlines."""
     if not content: return content
     content = content.strip().strip('"').strip("'")
     content = content.replace("\\n", "\n").replace("\\t", "\t")
@@ -76,28 +84,97 @@ def get_terabox_cookie_file() -> Optional[str]:
     return write_cookies(TERABOX_COOKIES, "tb")
 
 
+def get_title_from_url(url: str) -> str:
+    """
+    Extract human-readable title from URL.
+    Checks ?title= param first, then path filename.
+    Returns clean title without extension or underscores.
+    """
+    # 1. Check ?title= query param (common in CDN download links)
+    m = re.search(r"[?&]title=([^&]+)", url)
+    if m:
+        t = unquote(m.group(1))
+        # Remove extension
+        t = re.sub(r"\.(mp4|mkv|mp3|m4a|pdf|zip|rar|webm|avi|mov|flv|jpg|png|gif)$",
+                   "", t, flags=re.I)
+        # Replace separators with spaces
+        t = t.replace("_", " ").replace("-", " ").replace("+", " ")
+        t = re.sub(r"\s+", " ", t).strip()
+        if len(t) > 5:
+            return t[:100]
+
+    # 2. Fallback: filename from URL path
+    path = url.split("?")[0].rstrip("/")
+    fname = path.split("/")[-1]
+    if fname:
+        fname = unquote(fname)
+        fname = re.sub(r"\.(mp4|mkv|mp3|m4a|pdf|zip|rar|webm|avi|mov|flv|jpg|png|gif)$",
+                       "", fname, flags=re.I)
+        fname = fname.replace("_", " ").replace("-", " ").replace("+", " ")
+        fname = re.sub(r"\s+", " ", fname).strip()
+        if len(fname) > 5:
+            return fname[:100]
+    return ""
+
+
 def detect_url_type(url: str) -> str:
     u = url.lower()
-    if re.search(r"(youtube\.com|youtu\.be)", u):               return "youtube"
-    if re.search(r"instagram\.com", u):                          return "instagram"
-    if re.search(r"(tiktok\.com|vm\.tiktok)", u):               return "tiktok"
-    if re.search(r"(twitter\.com|x\.com|t\.co)", u):            return "twitter"
-    if re.search(r"(facebook\.com|fb\.watch)", u):               return "facebook"
-    if re.search(r"drive\.google\.com", u):                      return "gdrive"
-    if re.search(r"(terabox\.com|4funbox|nephobox)", u):         return "terabox"
-    if re.search(r"\.m3u8", u):                                  return "m3u8"
-    if re.search(r"\.(mp4|mkv|webm|avi|mov|flv|ts)(\?|$)", u):  return "direct_video"
-    if re.search(r"\.(mp3|aac|flac|wav|ogg|m4a)(\?|$)", u):     return "direct_audio"
-    if re.search(r"\.(jpg|jpeg|png|gif|webp|bmp)(\?|$)", u):    return "direct_image"
-    if re.search(r"\.(pdf|doc|docx|zip|rar|tar)(\?|$)", u):     return "direct_doc"
+    path = url.split("?")[0].lower()
+
+    # Social / video platforms
+    if re.search(r"(youtube\.com|youtu\.be)", u):                 return "youtube"
+    if re.search(r"instagram\.com", u):                            return "instagram"
+    if re.search(r"(tiktok\.com|vm\.tiktok)", u):                 return "tiktok"
+    if re.search(r"(twitter\.com|x\.com|t\.co)", u):              return "twitter"
+    if re.search(r"(facebook\.com|fb\.watch)", u):                 return "facebook"
+
+    # Google Drive (normal)
+    if re.search(r"drive\.google\.com", u):                        return "gdrive"
+
+    # Google Cloud Storage — treat as direct downloadable file
+    if re.search(r"storage\.googleapis\.com", u):                  return "direct_doc"
+
+    # Terabox — all domains
+    if any(d in u for d in TERABOX_DOMAINS):                       return "terabox"
+
+    # M3U8 streams
+    if re.search(r"\.m3u8", u):                                    return "m3u8"
+
+    # ── Direct file detection — check path extension ──
+    # Video
+    if re.search(r"\.(mp4|mkv|webm|avi|mov|flv|ts|3gp|m4v|wmv)(\?|$|/)", path):
+        return "direct_video"
+    # Audio
+    if re.search(r"\.(mp3|aac|flac|wav|ogg|m4a|opus|wma)(\?|$|/)", path):
+        return "direct_audio"
+    # Image
+    if re.search(r"\.(jpg|jpeg|png|gif|webp|bmp|tiff)(\?|$|/)", path):
+        return "direct_image"
+    # Document / archive
+    if re.search(r"\.(pdf|doc|docx|zip|rar|tar|7z|epub|ppt|pptx|xls|xlsx)(\?|$|/)", path):
+        return "direct_doc"
+
+    # ── Fallback: check ?title= param for extension ──
+    title_m = re.search(r"[?&]title=([^&]+)", url)
+    if title_m:
+        t = unquote(title_m.group(1)).lower()
+        if re.search(r"\.(mp4|mkv|webm|avi|mov|flv|ts)", t):  return "direct_video"
+        if re.search(r"\.(mp3|aac|flac|wav|m4a|opus)", t):    return "direct_audio"
+        if re.search(r"\.(jpg|jpeg|png|gif|webp)", t):         return "direct_image"
+        if re.search(r"\.(pdf|zip|rar|doc|docx|epub)", t):     return "direct_doc"
+
+    # ── CDN / download path patterns ──
+    if re.search(r"/(download|dl|file|get|fetch|tmp|recycle)/", u):
+        # Looks like a direct download path
+        if re.search(r"(\.mp4|video|vid)", u): return "direct_video"
+        return "direct_doc"
+
     return "generic"
 
 
 def is_valid_url(url: str) -> bool:
-    return bool(re.match(
-        r"^(https?://)?(www\.)?[\w\-]+(\.[\w\-]+)+[/\w\-._~:/?#\[\]@!$&'()*+,;=%]*$",
-        url.strip()
-    ))
+    url = url.strip()
+    return url.startswith("http://") or url.startswith("https://")
 
 
 def clean_filename(name: str) -> str:
