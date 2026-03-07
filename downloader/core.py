@@ -1,12 +1,12 @@
 """
 Serena Bot - Core Downloader
-FIXES:
-- YouTube: po token bypass (no cookies needed)  
-- M3U8: 5 min timeout, async progress
-- Direct encrypted links: aiohttp with browser headers
-- Progress: no title in status text
+KEY FIXES:
+- YouTube: cookies written as actual file on disk, verified before use
+- All video: send_video with supports_streaming=True (Telegram playable)
+- Audio /audio cmd: FFmpegExtractAudio postprocessor  
+- Progress: title shown in bar
 """
-import os, sys, asyncio, subprocess, uuid, time, shutil, zipfile, json
+import os, sys, asyncio, subprocess, uuid, time, shutil, zipfile, json, re
 from typing import Optional, Callable
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -15,7 +15,6 @@ if _root not in sys.path:
 
 from config import DL_DIR
 from utils.helpers import detect_url_type, clean_filename
-
 os.makedirs(DL_DIR, exist_ok=True)
 
 CHROME_UA = (
@@ -23,48 +22,55 @@ CHROME_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/133.0.0.0 Safari/537.36"
 )
-BROWSER_HEADERS = {
-    "User-Agent": CHROME_UA,
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-}
 
 
 # ── Cookie helpers ─────────────────────────────────────────────────────────
 
-def _fix_cookie_str(raw: str) -> str:
-    if not raw: return ""
-    raw = raw.strip().strip('"').strip("'")
-    return raw.replace("\\n", "\n").replace("\\t", "\t")
-
 def _write_cookie_file(raw: str, prefix: str) -> Optional[str]:
-    content = _fix_cookie_str(raw)
-    if not content: return None
+    """Write Netscape cookie file, fixing Render env var encoding issues."""
+    if not raw or not raw.strip():
+        return None
+    # Fix Render env var encoding — literal \n → real newlines
+    content = raw.strip()
+    content = content.strip('"').strip("'")
+    content = content.replace("\\n", "\n").replace("\\t", "\t")
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Validate — must have at least one tab-separated cookie line
+    lines = content.split("\n")
+    has_cookie = any(
+        len(l.split("\t")) >= 7 and not l.startswith("#")
+        for l in lines if l.strip()
+    )
+    if not has_cookie:
+        return None  # broken cookie content
+
     try:
-        import tempfile
-        tf = tempfile.NamedTemporaryFile(mode="w", prefix=f"{prefix}_",
-                                         suffix=".txt", delete=False, dir="/tmp")
-        if "# Netscape" not in content:
-            tf.write("# Netscape HTTP Cookie File\n")
-        tf.write(content + "\n")
-        tf.close()
-        return tf.name
+        path = f"/tmp/{prefix}_cookies_{os.getpid()}.txt"
+        with open(path, "w", encoding="utf-8") as f:
+            if "# Netscape" not in content:
+                f.write("# Netscape HTTP Cookie File\n")
+                f.write("# This file is generated automatically.\n\n")
+            f.write(content)
+            f.write("\n")
+        return path
     except Exception:
         return None
+
 
 async def check_yt_cookies_status() -> dict:
     from config import YT_COOKIES
     from datetime import datetime
     if not YT_COOKIES or not YT_COOKIES.strip():
         return {"valid": False, "expired": False,
-                "message": "❌ `YT_COOKIES` not set in environment."}
+                "message": "❌ `YT_COOKIES` not set in Render environment."}
     path = _write_cookie_file(YT_COOKIES, "yt_check")
     if not path:
-        return {"valid": False, "expired": False, "message": "❌ Failed to parse cookies."}
+        return {"valid": False, "expired": False,
+                "message": "❌ Cookie content invalid — check for encoding issues.\nMake sure you pasted raw Netscape format, not base64."}
     now = int(time.time())
-    valid = expired = 0; nearest = None
+    valid = expired = 0
+    nearest = None
     try:
         with open(path) as f:
             for line in f:
@@ -85,23 +91,24 @@ async def check_yt_cookies_status() -> dict:
         except: pass
     if valid == 0 and expired > 0:
         return {"valid": False, "expired": True,
-                "message": f"⚠️ All **{expired}** entries **expired**! Export fresh cookies."}
-    elif valid > 0:
+                "message": f"⚠️ All **{expired}** cookies **expired**!\nExport fresh cookies from Chrome."}
+    if valid > 0:
         exp_str = datetime.utcfromtimestamp(nearest).strftime("%Y-%m-%d") if nearest else "session"
         return {"valid": True, "expired": False,
-                "message": f"✅ Valid! `{valid}` entries. Expiry: `{exp_str}`"}
-    return {"valid": False, "expired": False, "message": "❌ No valid entries."}
+                "message": f"✅ **{valid}** valid entries. Nearest expiry: `{exp_str}`"}
+    return {"valid": False, "expired": False,
+            "message": "❌ No valid cookie entries found."}
 
 
 # ── File finder ────────────────────────────────────────────────────────────
 
 def _find_file(out_dir: str, info: Optional[dict], ydl) -> Optional[str]:
-    skip = {".jpg",".jpeg",".png",".webp",".part",".ytdl",".tmp"}
+    skip = {".jpg", ".jpeg", ".png", ".webp", ".part", ".ytdl", ".tmp"}
     if info:
         try:
             f = ydl.prepare_filename(info)
             base = os.path.splitext(f)[0]
-            for c in [f] + [f"{base}.{e}" for e in ["mp4","mkv","webm","mov","mp3","m4a"]]:
+            for c in [f] + [f"{base}.{e}" for e in ["mp4","mkv","webm","mov","mp3","m4a","opus"]]:
                 if os.path.exists(c) and os.path.getsize(c) > 500:
                     return c
         except Exception: pass
@@ -117,26 +124,26 @@ def _find_file(out_dir: str, info: Optional[dict], ydl) -> Optional[str]:
         return None
 
 
-# ── YouTube — po token method (no cookies required) ───────────────────────
+# ── YouTube download ────────────────────────────────────────────────────────
 
 async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
     import yt_dlp
     from config import YT_COOKIES, YT_PROXY
 
     fmt = "bestaudio/best" if audio_only else {
-        "144p": "best[height<=144]/best",
+        "144p": "worst[height>=144]/best[height<=144]/worst",
         "360p": "best[height<=360]/best",
         "720p": "best[height<=720]/best",
         "1080p": "best[height<=1080]/best",
-        "best": "best[ext=mp4]/best",
+        "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
     }.get(quality, "best[ext=mp4]/best")
 
     cookie_file = _write_cookie_file(YT_COOKIES, "yt") if YT_COOKIES else None
 
-    def _make(extractor_args: dict, extra: dict = {}):
+    def _opts(client_args: dict):
         o = {
             "format": fmt,
-            "outtmpl": os.path.join(out_dir, "%(title).80s.%(ext)s"),
+            "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
             "merge_output_format": "mp4",
             "quiet": True,
             "no_warnings": True,
@@ -147,13 +154,12 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
             "fragment_retries": 3,
             "socket_timeout": 30,
             "http_headers": {"User-Agent": CHROME_UA},
-            **extra,
         }
-        if extractor_args:
-            o["extractor_args"] = {"youtube": extractor_args}
         if YT_PROXY:
             o["proxy"] = YT_PROXY
-        if cookie_file and os.path.exists(cookie_file):
+        if client_args:
+            o["extractor_args"] = {"youtube": client_args}
+        if cookie_file:
             o["cookiefile"] = cookie_file
         if audio_only:
             o["postprocessors"] = [{"key": "FFmpegExtractAudio",
@@ -162,35 +168,27 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
             o["progress_hooks"] = [hook]
         return o
 
-    # Strategy list — ordered by bypass reliability on server IPs
     strategies = [
-        # 1. Android embed — most reliable, no sign-in needed
         {"player_client": ["android"], "player_skip": ["webpage", "configs"]},
-        # 2. Android VR
         {"player_client": ["android_vr"], "player_skip": ["webpage", "configs"]},
-        # 3. TV embedded
-        {"player_client": ["tv_embedded"], "player_skip": ["webpage"]},
-        # 4. iOS
+        {"player_client": ["tv_embedded"]},
         {"player_client": ["ios"], "player_skip": ["webpage", "configs"]},
-        # 5. mweb
         {"player_client": ["mweb"]},
-        # 6. web_creator (bypasses some restrictions)
-        {"player_client": ["web_creator"]},
-        # 7. web with po_token workaround
-        {},
+        {},  # default web
     ]
 
     loop = asyncio.get_event_loop()
     last_err = ""
 
     for strat in strategies:
-        opts = _make(strat)
+        opts = _opts(strat)
         def _run(o=opts):
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url, download=True)
                 if not info: return None, None
                 if "entries" in info:
-                    res = [_find_file(out_dir, e, ydl) for e in (info.get("entries") or []) if e]
+                    res = [_find_file(out_dir, e, ydl)
+                           for e in (info.get("entries") or []) if e]
                     return [r for r in res if r] or None, info
                 return _find_file(out_dir, info, ydl), info
         try:
@@ -208,24 +206,27 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
         try: os.remove(cookie_file)
         except: pass
 
+    # Give user a clear actionable error
     raise RuntimeError(
-        "🍪 **YouTube bot detection — cookies required.**\n\n"
-        "**Fix:**\n"
-        "`1.` Open YouTube in Chrome, login\n"
-        "`2.` Install **Get cookies.txt LOCALLY** extension\n"
-        "`3.` Click extension → Export\n"
-        "`4.` Render → Environment → `YT_COOKIES` → paste content\n"
-        "`5.` Redeploy ✅"
+        "🔐 **YouTube blocked this server.**\n\n"
+        "**Solution — set fresh cookies:**\n"
+        "`1.` Open Chrome → youtube.com → Login\n"
+        "`2.` Install `Get cookies.txt LOCALLY` extension\n"
+        "`3.` Click extension → ✅ Export current tab\n"
+        "`4.` Render Dashboard → Environment\n"
+        "`5.` Key: `YT_COOKIES` → paste **entire file content**\n"
+        "`6.` Save → Manual Deploy\n\n"
+        f"Last error: `{last_err[:100]}`"
     )
 
 
-# ── Generic yt-dlp ─────────────────────────────────────────────────────────
+# ── Generic yt-dlp (Instagram, TikTok, etc.) ──────────────────────────────
 
-async def _generic_ydl(url, out_dir, cookie_file, hook) -> tuple:
+async def _generic_ydl(url, out_dir, cookie_file, hook, audio_only=False) -> tuple:
     import yt_dlp
     opts = {
-        "format": "best[ext=mp4]/best",
-        "outtmpl": os.path.join(out_dir, "%(title).80s.%(ext)s"),
+        "format": "bestaudio/best" if audio_only else "best[ext=mp4]/best",
+        "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
@@ -235,6 +236,9 @@ async def _generic_ydl(url, out_dir, cookie_file, hook) -> tuple:
         "socket_timeout": 30,
         "http_headers": {"User-Agent": CHROME_UA},
     }
+    if audio_only:
+        opts["postprocessors"] = [{"key": "FFmpegExtractAudio",
+                                    "preferredcodec": "mp3", "preferredquality": "192"}]
     if cookie_file: opts["cookiefile"] = cookie_file
     if hook: opts["progress_hooks"] = [hook]
     loop = asyncio.get_event_loop()
@@ -243,13 +247,14 @@ async def _generic_ydl(url, out_dir, cookie_file, hook) -> tuple:
             info = ydl.extract_info(url, download=True)
             if not info: return None, None
             if "entries" in info:
-                res = [_find_file(out_dir, e, ydl) for e in (info.get("entries") or []) if e]
+                res = [_find_file(out_dir, e, ydl)
+                       for e in (info.get("entries") or []) if e]
                 return [r for r in res if r] or None, info
             return _find_file(out_dir, info, ydl), info
     return await loop.run_in_executor(None, _run)
 
 
-# ── Main download entry ────────────────────────────────────────────────────
+# ── Main entry ────────────────────────────────────────────────────────────
 
 async def download_with_ytdlp(url, out_dir, quality="best",
                                audio_only=False, progress_hook=None) -> tuple:
@@ -267,7 +272,7 @@ async def download_with_ytdlp(url, out_dir, quality="best",
         cookie_file = _write_cookie_file(TERABOX_COOKIES, "tb")
 
     try:
-        return await _generic_ydl(url, out_dir, cookie_file, progress_hook)
+        return await _generic_ydl(url, out_dir, cookie_file, progress_hook, audio_only)
     except Exception as e:
         raise RuntimeError(f"Download failed: {str(e)[:200]}")
     finally:
@@ -276,95 +281,73 @@ async def download_with_ytdlp(url, out_dir, quality="best",
             except: pass
 
 
-# ── M3U8 (encrypted + standard) — 5min timeout ────────────────────────────
+# ── M3U8 ─────────────────────────────────────────────────────────────────
 
 async def download_m3u8(url: str, out_dir: str, progress_hook=None) -> tuple:
-    """
-    Download M3U8 streams including AES-128 encrypted ones.
-    Hard 5-minute timeout to prevent hanging.
-    """
     os.makedirs(out_dir, exist_ok=True)
     out_file = os.path.join(out_dir, f"stream_{uuid.uuid4().hex[:8]}.mp4")
     loop = asyncio.get_event_loop()
-
     def _run():
         cmd = [
             "ffmpeg", "-y",
             "-headers", f"User-Agent: {CHROME_UA}\r\n",
             "-allowed_extensions", "ALL",
             "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-            "-i", url,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            out_file
+            "-i", url, "-c", "copy", "-movflags", "+faststart", out_file
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            if result.returncode != 0:
-                raise RuntimeError(f"ffmpeg: {result.stderr[-200:]}")
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                raise RuntimeError(f"ffmpeg: {r.stderr[-200:]}")
             if not os.path.exists(out_file) or os.path.getsize(out_file) < 1000:
-                raise RuntimeError("Output file empty after ffmpeg")
+                raise RuntimeError("Output file empty")
             return out_file
         except subprocess.TimeoutExpired:
-            raise RuntimeError("⏱ Stream download timed out (5 min). Try a shorter clip.")
-
+            raise RuntimeError("⏱ Stream timed out (5 min limit).")
     try:
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, _run),
-            timeout=310
-        ), None
+        result = await asyncio.wait_for(loop.run_in_executor(None, _run), timeout=310)
+        return result, None
     except asyncio.TimeoutError:
         raise RuntimeError("⏱ Stream download timed out.")
 
 
-# ── Direct file download ────────────────────────────────────────────────────
+# ── Direct file ───────────────────────────────────────────────────────────
 
-async def download_direct(url: str, out_dir: str, filename=None,
-                           extra_headers: dict = None, progress_hook=None) -> tuple:
-    # Try yt-dlp first (handles many sites)
+async def download_direct(url, out_dir, filename=None,
+                           extra_headers=None, progress_hook=None) -> tuple:
     try:
         r = await _generic_ydl(url, out_dir, None, progress_hook)
         if r[0]: return r
-    except Exception:
-        pass
+    except Exception: pass
 
-    # aiohttp fallback with browser headers
     import aiohttp
     os.makedirs(out_dir, exist_ok=True)
     if not filename:
         filename = url.split("/")[-1].split("?")[0] or f"file_{uuid.uuid4().hex[:8]}"
     filename = clean_filename(filename)
     out_file = os.path.join(out_dir, filename)
-    hdrs = {**BROWSER_HEADERS, **(extra_headers or {})}
-
-    async with aiohttp.ClientSession(headers=hdrs) as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=3600),
-                               allow_redirects=True) as resp:
-            if resp.status == 403:
-                raise RuntimeError("403 Forbidden — link expired or requires login.")
+    hdrs = {"User-Agent": CHROME_UA, **(extra_headers or {})}
+    async with aiohttp.ClientSession(headers=hdrs) as s:
+        async with s.get(url, timeout=aiohttp.ClientTimeout(total=3600),
+                         allow_redirects=True) as resp:
             resp.raise_for_status()
             total = int(resp.headers.get("Content-Length", 0))
             done = 0
             with open(out_file, "wb") as f:
                 async for chunk in resp.content.iter_chunked(65536):
-                    f.write(chunk)
-                    done += len(chunk)
-                    if progress_hook:
-                        await progress_hook(done, total)
+                    f.write(chunk); done += len(chunk)
+                    if progress_hook: await progress_hook(done, total)
     return out_file, None
 
 
-# ── Google Drive folder ─────────────────────────────────────────────────────
+# ── Google Drive folder ───────────────────────────────────────────────────
 
-async def download_gdrive_folder(url: str, out_dir: str, progress_hook=None) -> tuple:
+async def download_gdrive_folder(url, out_dir, progress_hook=None) -> tuple:
     import yt_dlp
     os.makedirs(out_dir, exist_ok=True)
-    opts = {
-        "format": "best",
-        "outtmpl": os.path.join(out_dir, "%(title).80s.%(ext)s"),
-        "quiet": True, "no_warnings": True, "noplaylist": False,
-        "retries": 3, "http_headers": {"User-Agent": CHROME_UA},
-    }
+    opts = {"format": "best", "outtmpl": os.path.join(out_dir, "%(title).80s.%(ext)s"),
+            "quiet": True, "no_warnings": True, "noplaylist": False,
+            "retries": 3, "http_headers": {"User-Agent": CHROME_UA}}
     if progress_hook: opts["progress_hooks"] = [progress_hook]
     loop = asyncio.get_event_loop()
     def _run():
@@ -381,9 +364,9 @@ async def download_gdrive_folder(url: str, out_dir: str, progress_hook=None) -> 
     return await loop.run_in_executor(None, _run)
 
 
-# ── Thumbnail helpers ───────────────────────────────────────────────────────
+# ── Thumbnail helpers ─────────────────────────────────────────────────────
 
-def download_thumb_from_url(thumb_url: str, video_id: str) -> Optional[str]:
+def download_thumb_from_url(thumb_url, video_id) -> Optional[str]:
     try:
         import requests as req
         r = req.get(thumb_url, headers={"User-Agent": CHROME_UA}, timeout=10)
@@ -394,8 +377,7 @@ def download_thumb_from_url(thumb_url: str, video_id: str) -> Optional[str]:
     except Exception: pass
     return None
 
-
-def find_thumbnail(base_path: str) -> Optional[str]:
+def find_thumbnail(base_path) -> Optional[str]:
     for ext in (".jpg", ".jpeg", ".webp", ".png"):
         t = base_path.rsplit(".", 1)[0] + ext
         if os.path.exists(t) and os.path.getsize(t) > 500:
@@ -409,8 +391,7 @@ def find_thumbnail(base_path: str) -> Optional[str]:
             return t
     return None
 
-
-async def generate_thumbnail(video_path: str) -> Optional[str]:
+async def generate_thumbnail(video_path) -> Optional[str]:
     thumb_path = video_path.rsplit(".", 1)[0] + "_thumb.jpg"
     loop = asyncio.get_event_loop()
     def _run():
@@ -420,59 +401,54 @@ async def generate_thumbnail(video_path: str) -> Optional[str]:
                                  "-show_format", video_path], capture_output=True, text=True)
             duration = float(json.loads(r.stdout).get("format", {}).get("duration", 0))
         except Exception: pass
-        for seek in ([int(duration * p) for p in [0.1, 0.2, 0.3] if duration > 5] + [5, 2, 0]):
+        for seek in ([int(duration*p) for p in [0.1,0.2,0.3] if duration>5]+[5,2,0]):
             r = subprocess.run(
-                ["ffmpeg", "-y", "-ss", str(seek), "-i", video_path,
-                 "-vframes", "1", "-vf", "scale=320:-1", "-q:v", "3", thumb_path],
+                ["ffmpeg","-y","-ss",str(seek),"-i",video_path,
+                 "-vframes","1","-vf","scale=320:-1","-q:v","3",thumb_path],
                 capture_output=True)
-            if r.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 2000:
+            if r.returncode==0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path)>2000:
                 return thumb_path
         return None
     return await loop.run_in_executor(None, _run)
 
-
-async def remux_to_mp4(input_path: str) -> str:
-    """Remux to Telegram-streamable MP4 with faststart."""
+async def remux_to_mp4(input_path) -> str:
     out = input_path.rsplit(".", 1)[0] + "_tg.mp4"
-    cmd = ["ffmpeg", "-y", "-i", input_path, "-c", "copy", "-movflags", "+faststart", out]
     loop = asyncio.get_event_loop()
     def _run():
-        r = subprocess.run(cmd, capture_output=True)
-        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 500:
+        r = subprocess.run(
+            ["ffmpeg","-y","-i",input_path,"-c","copy","-movflags","+faststart",out],
+            capture_output=True)
+        if r.returncode==0 and os.path.exists(out) and os.path.getsize(out)>500:
             try: os.remove(input_path)
             except: pass
             return out
         return input_path
     return await loop.run_in_executor(None, _run)
 
-
-def get_video_info(path: str) -> dict:
+def get_video_info(path) -> dict:
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_streams", "-show_format", "-select_streams", "v:0", path],
+            ["ffprobe","-v","quiet","-print_format","json",
+             "-show_streams","-show_format","-select_streams","v:0",path],
             capture_output=True, text=True)
         data = json.loads(r.stdout)
         stream = (data.get("streams") or [{}])[0]
-        dur = float(data.get("format", {}).get("duration", 0))
-        return {"width": stream.get("width", 0), "height": stream.get("height", 0),
-                "duration": int(dur)}
+        dur = float(data.get("format",{}).get("duration",0))
+        return {"width":stream.get("width",0),"height":stream.get("height",0),"duration":int(dur)}
     except Exception:
-        return {"width": 0, "height": 0, "duration": 0}
+        return {"width":0,"height":0,"duration":0}
 
-
-async def zip_folder(folder_path: str, out_path: str, name: str = "files") -> str:
+async def zip_folder(folder_path, out_path, name="files") -> str:
     zip_path = os.path.join(out_path, f"{clean_filename(name)}.zip")
     loop = asyncio.get_event_loop()
     def _zip():
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as zf:
             for fname in os.listdir(folder_path):
                 fp = os.path.join(folder_path, fname)
-                if os.path.isfile(fp) and not fname.endswith((".part", ".ytdl")):
+                if os.path.isfile(fp) and not fname.endswith((".part",".ytdl")):
                     zf.write(fp, fname)
         return zip_path
     return await loop.run_in_executor(None, _zip)
-
 
 def cleanup_files(*paths):
     for p in paths:
