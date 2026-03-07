@@ -1,7 +1,3 @@
-"""
-Serena Downloader Bot - Config
-@SerenaXDownloader_bot
-"""
 import os
 from typing import List
 
@@ -13,22 +9,23 @@ OWNER_IDS: List[int] = [
     int(x.strip()) for x in os.environ.get("OWNER_IDS", "1598576202").split(",")
     if x.strip().isdigit()
 ]
-OWNER_USERNAME: str = os.environ.get("OWNER_USERNAME", "Xioqui_xin")
+OWNER_USERNAME: str  = os.environ.get("OWNER_USERNAME",  "Xioqui_xin")
 SUPPORT_USERNAME: str = os.environ.get("SUPPORT_USERNAME", "TechnicalSerena")
+SUPPORT_CHANNEL: str  = os.environ.get("SUPPORT_CHANNEL",  "TechnicalSerena")   # channel username
 FORCE_SUB_CHANNEL: str = os.environ.get("FORCE_SUB_CHANNEL", "serenaunzipbot")
 
-FREE_LIMIT: int = int(os.environ.get("FREE_LIMIT", "3"))
-BASIC_LIMIT: int = int(os.environ.get("BASIC_LIMIT", "15"))
+FREE_LIMIT: int    = int(os.environ.get("FREE_LIMIT",    "3"))
+BASIC_LIMIT: int   = int(os.environ.get("BASIC_LIMIT",   "15"))
 PREMIUM_LIMIT: int = int(os.environ.get("PREMIUM_LIMIT", "50"))
 
 DB_PATH: str = os.environ.get("DB_PATH", "/tmp/serena_db/bot.db")
-DL_DIR: str = os.environ.get("DL_DIR", "/tmp/serena_dl")
+DL_DIR: str  = os.environ.get("DL_DIR",  "/tmp/serena_dl")
 
-YT_COOKIES: str = os.environ.get("YT_COOKIES", "")
+YT_COOKIES: str        = os.environ.get("YT_COOKIES", "")
 INSTAGRAM_COOKIES: str = os.environ.get("INSTAGRAM_COOKIES", "")
-TERABOX_COOKIES: str = os.environ.get("TERABOX_COOKIES", "")
+TERABOX_COOKIES: str   = os.environ.get("TERABOX_COOKIES", "")
 
-# Optional proxy for YouTube (format: http://user:pass@host:port or http://host:port)
+# Webshare rotating proxy — http://user-rotate:pass@p.webshare.io:80
 YT_PROXY: str = os.environ.get("YT_PROXY", "")
 
 PORT: int = int(os.environ.get("PORT", "10000"))
@@ -40,18 +37,16 @@ PLANS = {
     "owner":   {"name": "Owner 👑",   "limit": 999999,        "days": 0},
 }
 
-BOT_NAME = "Serena Downloader Bot"
+BOT_NAME     = "Serena Downloader"
 BOT_USERNAME = "SerenaXDownloader_bot"
 
-HEADER  = "⋆｡° ✮ °｡⋆"
-DIVIDER = "»»──── ✦ ────««"
-FOOTER  = "⋆ ｡˚ ˚｡ ⋆"
-BULLET  = "▸"
+# Queue delay between jobs (seconds)
+QUEUE_DELAY: float = float(os.environ.get("QUEUE_DELAY", "2.0"))
 
 REACTION_EMOJIS = [
     "🔥","❤️","👍","🎉","😍","🤩","💯","⚡",
     "🌟","✨","🎵","🎬","📥","💎","🚀","👏",
-    "😎","🤙","💪","🙌"
+    "😎","🤙","💪","🙌","🫡","🥰","😘","🎶",
 ]
 
 BOT_LOCK: bool = False
