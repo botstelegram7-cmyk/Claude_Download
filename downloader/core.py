@@ -34,6 +34,7 @@ CHROME_UA = (
     "Chrome/133.0.0.0 Safari/537.36"
 )
 
+# Expanded Invidious instances
 INVIDIOUS_INSTANCES = [
     "https://inv.nadeko.net",
     "https://invidious.nerdvpn.de",
@@ -47,10 +48,12 @@ INVIDIOUS_INSTANCES = [
     "https://invidious.projectsegfau.lt",
     "https://invidious.flokinet.to",
     "https://invidious.tiekoetter.com",
+    "https://invidious.weblibre.org",
+    "https://yt.artemislena.eu",
 ]
 
 
-# ── yt-dlp auto-update ─────────────────────────────────────────────────────
+# ── yt-dlp auto-update (force) ─────────────────────────────────────────────
 _ytdlp_updated = False
 async def _ensure_ytdlp_updated():
     global _ytdlp_updated
@@ -60,16 +63,20 @@ async def _ensure_ytdlp_updated():
     loop = asyncio.get_event_loop()
     def _upd():
         try:
-            subprocess.run(
+            # Try multiple pip commands
+            cmds = [
                 ["pip3", "install", "--upgrade", "yt-dlp", "-q"],
-                capture_output=True, timeout=30
-            )
+                ["pip", "install", "--upgrade", "yt-dlp", "-q"],
+                ["python3", "-m", "pip", "install", "--upgrade", "yt-dlp", "-q"]
+            ]
+            for cmd in cmds:
+                subprocess.run(cmd, capture_output=True, timeout=30)
         except Exception:
             pass
     await loop.run_in_executor(None, _upd)
 
 
-# ── Cookie file writer with validation ─────────────────────────────────────
+# ── Cookie file writer with strict validation ─────────────────────────────
 def _write_cookie_file(raw: str, prefix: str) -> Optional[str]:
     if not raw or not raw.strip():
         logger.warning(f"No cookie content for {prefix}")
@@ -78,7 +85,7 @@ def _write_cookie_file(raw: str, prefix: str) -> Optional[str]:
     content = content.replace("\\n", "\n").replace("\\t", "\t")
     content = content.replace("\r\n", "\n").replace("\r", "\n")
     lines = content.split("\n")
-    # Validate that at least one line looks like a valid cookie
+    # Validate at least one cookie line
     has_cookie = any(
         len(l.split("\t")) >= 7 and not l.startswith("#")
         for l in lines if l.strip()
@@ -140,10 +147,10 @@ async def check_yt_cookies_status() -> dict:
     return {"valid": False, "expired": False, "message": "❌ No valid entries."}
 
 
-# ── File finder ────────────────────────────────────────────────────────────
+# ── File finder (with safe checks) ────────────────────────────────────────
 def _find_file(out_dir: str, info: Optional[dict], ydl) -> Optional[str]:
     skip = {".jpg",".jpeg",".png",".webp",".part",".ytdl",".tmp"}
-    if info:
+    if info and isinstance(info, dict):
         try:
             f = ydl.prepare_filename(info)
             base = os.path.splitext(f)[0]
@@ -230,7 +237,7 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
         _make(["mediaconnect"]),
         _make(["mweb"]),
         _make(["android_testsuite"]),
-        # Default fallback
+        # Default fallback with explicit extractor args
         {
             "format": fmt,
             "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
@@ -240,7 +247,7 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
             "postprocessors": [], "retries": 2,
             "socket_timeout": 30,
             "http_headers": {"User-Agent": CHROME_UA},
-            "extractor_args": {"youtubetab": {"skip": ["authcheck"]}},
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
             **({} if not YT_PROXY else {"proxy": YT_PROXY}),
             **({} if not cookie_file else {"cookiefile": cookie_file}),
             **({} if not hook else {"progress_hooks": [hook]}),
@@ -312,7 +319,7 @@ async def _yt_via_invidious(video_id: str, out_dir: str, quality: str,
                 headers={"User-Agent": CHROME_UA},
                 connector=aiohttp.TCPConnector(ssl=False)
             ) as s:
-                async with s.get(api, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                async with s.get(api, timeout=aiohttp.ClientTimeout(total=20)) as r:
                     if r.status != 200: return None
                     return await r.json()
         except Exception as e:
@@ -320,9 +327,11 @@ async def _yt_via_invidious(video_id: str, out_dir: str, quality: str,
             return None
 
     data = None
+    used_instance = None
     for inst in INVIDIOUS_INSTANCES:
         data = await _try(inst)
         if data:
+            used_instance = inst
             logger.info(f"Using Invidious instance: {inst}")
             break
 
@@ -373,7 +382,7 @@ async def _yt_via_invidious(video_id: str, out_dir: str, quality: str,
     return out_file, {"title": title, "uploader": author, "duration": duration, "ext": out_ext}
 
 
-# ── Generic video host scraper (streaam.net etc.) ─────────────────────────
+# ── Generic video host scraper (improved) ─────────────────────────────────
 async def _scrape_video_host(url: str, out_dir: str, hook) -> tuple:
     import aiohttp
     os.makedirs(out_dir, exist_ok=True)
@@ -490,8 +499,7 @@ async def _scrape_video_host(url: str, out_dir: str, hook) -> tuple:
     return out_file, {"title": title or "Video", "ext": "mp4"}
 
 
-# ── Terabox ───────────────────────────────────────────────────────────────
-# Expanded third-party APIs
+# ── Terabox (improved timeouts and APIs) ──────────────────────────────────
 _TERABOX_THIRD_PARTY_APIS = [
     "https://teraboxdownloader.online/api/download?url=",
     "https://terabox.udayscriptsx.workers.dev/?url=",
@@ -500,6 +508,8 @@ _TERABOX_THIRD_PARTY_APIS = [
     "https://terabox-dl-api.vercel.app/api?url=",
     "https://terabox.hnn.workers.dev/?url=",
     "https://terabox.giize.com/?url=",
+    "https://terabox-video-downloader.vercel.app/api?url=",
+    "https://terabox.softor.net/api?url=",
 ]
 
 _TERABOX_DOMAINS_API = [
@@ -508,11 +518,13 @@ _TERABOX_DOMAINS_API = [
     "https://teraboxapp.com",
     "https://www.terabox.app",
     "https://www.4funbox.com",
+    "https://www.mirrobox.com",
+    "https://www.nephobox.com",
+    "https://www.freeterabox.com",
 ]
 
 
 def _extract_terabox_surl(url: str) -> Optional[str]:
-    """Extract surl from any Terabox URL format"""
     patterns = [
         r'[?&]surl=([a-zA-Z0-9_-]+)',
         r'/s/1?([a-zA-Z0-9_-]+)',
@@ -527,7 +539,6 @@ def _extract_terabox_surl(url: str) -> Optional[str]:
 
 
 def _normalize_terabox_url(url: str) -> str:
-    """Normalize any Terabox URL to standard format"""
     surl = _extract_terabox_surl(url)
     if surl:
         clean = surl.lstrip("1") if len(surl) > 20 else surl
@@ -536,14 +547,13 @@ def _normalize_terabox_url(url: str) -> str:
 
 
 def _terabox_third_party(url: str) -> tuple:
-    """Try free third-party APIs to get direct download link"""
     import requests as req
     from urllib.parse import quote
     normalized = _normalize_terabox_url(url)
     for api in _TERABOX_THIRD_PARTY_APIS:
         try:
             api_url = api + quote(normalized, safe="")
-            r = req.get(api_url, timeout=30)
+            r = req.get(api_url, timeout=60)
             if r.status_code != 200: continue
             ct = r.headers.get("Content-Type","")
             data = r.json() if "json" in ct else {}
@@ -570,7 +580,6 @@ def _terabox_third_party(url: str) -> tuple:
 
 
 def _terabox_official_api(surl: str, cookie: str) -> tuple:
-    """Use official Terabox API with cookies"""
     import requests as req
     if not cookie: return None, None
     headers = {
@@ -583,7 +592,7 @@ def _terabox_official_api(surl: str, cookie: str) -> tuple:
         for prefix in ["1", ""]:
             try:
                 api_url = f"{base}/api/shorturlinfo?shorturl={prefix}{surl}&root=1"
-                r = req.get(api_url, headers=headers, timeout=30)
+                r = req.get(api_url, headers=headers, timeout=60)
                 if r.status_code != 200: continue
                 data = r.json()
                 if data.get("errno") == 0:
@@ -601,13 +610,12 @@ def _terabox_official_api(surl: str, cookie: str) -> tuple:
 
 
 def _terabox_scrape(url: str, cookie: str = "") -> tuple:
-    """Scrape Terabox page for direct dlink"""
     import requests as req
     try:
         headers = {"User-Agent": CHROME_UA, "Accept": "text/html"}
         if cookie: headers["Cookie"] = cookie
         normalized = _normalize_terabox_url(url)
-        r = req.get(normalized, headers=headers, timeout=30)
+        r = req.get(normalized, headers=headers, timeout=60)
         text = r.text
         dlink = None
         for pat in [r'"dlink"\s*:\s*"([^"]+)"', r'"downloadLink"\s*:\s*"([^"]+)"']:
@@ -632,7 +640,6 @@ def _terabox_scrape(url: str, cookie: str = "") -> tuple:
 
 
 def _detect_file_type_magic(file_path: str) -> str:
-    """Detect real file type from magic bytes — same as terabox bot"""
     try:
         with open(file_path, "rb") as f:
             h = f.read(32)
@@ -659,7 +666,6 @@ def _detect_file_type_magic(file_path: str) -> str:
 
 async def _terabox_download_file(dl_url: str, filename: str, out_dir: str,
                                   cookie: str, hook) -> tuple:
-    """Download the actual file from resolved Terabox direct URL"""
     import aiohttp
     os.makedirs(out_dir, exist_ok=True)
     headers = {
@@ -675,7 +681,6 @@ async def _terabox_download_file(dl_url: str, filename: str, out_dir: str,
         async with s.get(dl_url, timeout=aiohttp.ClientTimeout(total=3600),
                          allow_redirects=True) as resp:
             resp.raise_for_status()
-            # Fix filename from Content-Disposition if available
             cd = resp.headers.get("Content-Disposition","")
             if cd:
                 m = re.search(r'filename[^;]*=([^;\r\n]+)', cd, re.I)
@@ -693,7 +698,6 @@ async def _terabox_download_file(dl_url: str, filename: str, out_dir: str,
                         try: await hook(done, total)
                         except Exception: pass
 
-    # Fix extension from magic bytes
     real_ext = _detect_file_type_magic(out_file)
     if real_ext and real_ext != "html":
         cur_ext = os.path.splitext(out_file)[1].lstrip(".").lower()
@@ -714,13 +718,6 @@ async def _terabox_download_file(dl_url: str, filename: str, out_dir: str,
 
 
 async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
-    """
-    Terabox download — 4 methods from terabox bot reference:
-    1. Third-party free APIs (no cookies)
-    2. Official Terabox API (with cookies)
-    3. Page scraping (dlink extraction)
-    4. yt-dlp fallback (with proxy)
-    """
     from config import TERABOX_COOKIES, YT_PROXY
     import yt_dlp
 
@@ -733,7 +730,7 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
     loop = asyncio.get_event_loop()
     last_err = ""
 
-    # ── Method 1: Third-party free APIs ────────────────────────────────────
+    # Method 1: Third-party APIs
     try:
         dl_url, filename = await loop.run_in_executor(None, _terabox_third_party, url)
         if dl_url:
@@ -743,7 +740,7 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
     except Exception as e:
         last_err = f"API: {str(e)[:60]}"
 
-    # ── Method 2: Official API with cookies ────────────────────────────────
+    # Method 2: Official API with cookies
     if surl and cookie_str:
         try:
             dl_url, filename = await loop.run_in_executor(
@@ -756,7 +753,7 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
         except Exception as e:
             last_err += f" | OfficialAPI: {str(e)[:60]}"
 
-    # ── Method 3: Page scraping ─────────────────────────────────────────────
+    # Method 3: Page scraping
     try:
         dl_url, filename = await loop.run_in_executor(
             None, _terabox_scrape, url, cookie_str
@@ -768,19 +765,18 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
     except Exception as e:
         last_err += f" | Scrape: {str(e)[:60]}"
 
-    # ── Method 4: yt-dlp fallback ───────────────────────────────────────────
+    # Method 4: yt-dlp fallback
     base = {
         "format": "best[ext=mp4]/best",
         "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
         "merge_output_format": "mp4",
         "quiet": True, "no_warnings": True,
-        "retries": 3, "socket_timeout": 30,
+        "retries": 3, "socket_timeout": 60,
         "http_headers": {"User-Agent": CHROME_UA},
     }
     if cookie_file: base["cookiefile"] = cookie_file
     if hook: base["progress_hooks"] = [hook]
 
-    # Try with proxy first if available
     if YT_PROXY:
         proxy_opts = base.copy()
         proxy_opts["proxy"] = YT_PROXY
@@ -883,7 +879,7 @@ async def download_with_ytdlp(url, out_dir, quality="best",
             except: pass
 
 
-# ── Direct file (pure aiohttp) ────────────────────────────────────────────
+# ── Direct file (pure aiohttp) with improved headers ──────────────────────
 async def download_direct(url: str, out_dir: str, filename: str = None,
                            extra_headers: dict = None, progress_hook=None) -> tuple:
     import aiohttp
@@ -894,18 +890,19 @@ async def download_direct(url: str, out_dir: str, filename: str = None,
         "User-Agent": CHROME_UA,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "identity",
+        "Accept-Encoding": "identity",  # avoid compression
         "Connection": "keep-alive",
         "Referer": "/".join(url.split("/")[:3]) + "/",
         **(extra_headers or {})
     }
 
     async with aiohttp.ClientSession(headers=hdrs) as s:
-        async with s.get(url, timeout=aiohttp.ClientTimeout(total=3600),
+        async with s.get(url, timeout=aiohttp.ClientTimeout(total=60),
                          allow_redirects=True) as resp:
             if resp.status in (403, 401):
+                # Try without Referer
                 hdrs2 = {k: v for k, v in hdrs.items() if k != "Referer"}
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=3600),
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=60),
                                   headers=hdrs2, allow_redirects=True) as r2:
                     if r2.status in (403, 401):
                         raise RuntimeError(f"❌ {r2.status} — link expired.")
@@ -981,7 +978,7 @@ async def download_m3u8(url: str, out_dir: str, progress_hook=None) -> tuple:
         raise RuntimeError("⏱ Stream timed out.")
 
 
-# ── Google Drive folder (with cookie support) ─────────────────────────────
+# ── Google Drive folder (with cookie support and safe return) ─────────────
 async def download_gdrive_folder(url, out_dir, progress_hook=None) -> tuple:
     import yt_dlp
     from config import GDRIVE_COOKIES
@@ -1007,24 +1004,31 @@ async def download_gdrive_folder(url, out_dir, progress_hook=None) -> tuple:
     def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-        skip = {".part", ".ytdl", ".tmp"}
-        files = sorted([
-            os.path.join(out_dir, x) for x in os.listdir(out_dir)
-            if os.path.isfile(os.path.join(out_dir, x))
-            and not any(x.endswith(e) for e in skip)
-            and os.path.getsize(os.path.join(out_dir, x)) > 0
-        ], key=os.path.getmtime)
-        return files, info
+            if not info:
+                return [], None
+            skip = {".part", ".ytdl", ".tmp"}
+            files = sorted([
+                os.path.join(out_dir, x) for x in os.listdir(out_dir)
+                if os.path.isfile(os.path.join(out_dir, x))
+                and not any(x.endswith(e) for e in skip)
+                and os.path.getsize(os.path.join(out_dir, x)) > 0
+            ], key=os.path.getmtime)
+            return files, info
 
     try:
-        return await loop.run_in_executor(None, _run)
+        files, info = await loop.run_in_executor(None, _run)
+        if not files:
+            raise RuntimeError("No files downloaded from Google Drive")
+        return files, info
+    except Exception as e:
+        raise RuntimeError(f"Google Drive download failed: {e}")
     finally:
         if cookie_file and os.path.exists(cookie_file):
             try: os.remove(cookie_file)
             except: pass
 
 
-# ── Thumbnails ────────────────────────────────────────────────────────────
+# ── Thumbnails (unchanged) ────────────────────────────────────────────────
 def download_thumb_from_url(thumb_url, video_id) -> Optional[str]:
     try:
         import requests as req
