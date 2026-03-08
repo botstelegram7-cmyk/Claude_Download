@@ -539,3 +539,24 @@ async def cb_settings(client: Client, query: CallbackQuery):
         f"{B} Progress: DL+UL\n{B} Reactions: 75%",
         reply_markup=_kb_back()
     )
+
+
+# ==================== NEW COMMAND: /testreact ====================
+
+@Client.on_message(filters.command("testreact") & ~filters.outgoing)
+async def test_react_cmd(client: Client, message: Message):
+    """Test reaction feature (only works in private chats)"""
+    if message.chat.type != "private":
+        await message.reply_text("❌ This command only works in private chat.")
+        return
+    msg = await message.reply_text("Testing reaction...")
+    await asyncio.sleep(1)
+    try:
+        await client.send_reaction(
+            chat_id=message.chat.id,
+            message_id=message.id,
+            emoji="🔥"
+        )
+        await msg.edit_text("✅ Reaction sent! (If you don't see it, check bot permissions)")
+    except Exception as e:
+        await msg.edit_text(f"❌ Reaction failed: {e}")
