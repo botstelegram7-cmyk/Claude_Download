@@ -6,6 +6,7 @@ These bypass "Sign in to confirm you're not a bot"
 """
 import os, sys, asyncio, subprocess, uuid, time, shutil, zipfile, json, re
 from typing import Optional
+import logging
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
@@ -13,6 +14,9 @@ if _root not in sys.path:
 
 from config import DL_DIR
 from utils.helpers import detect_url_type, clean_filename, TERABOX_DOMAINS, get_title_from_url
+
+logger = logging.getLogger("SerenaBot.Downloader")
+
 os.makedirs(DL_DIR, exist_ok=True)
 
 CHROME_UA = (
@@ -27,6 +31,11 @@ INVIDIOUS_INSTANCES = [
     "https://invidious.privacydev.net",
     "https://vid.puffyan.us",
     "https://y.com.sb",
+    "https://invidious.private.coffee",
+    "https://inv.vern.cc",
+    "https://invidious.snopyta.org",
+    "https://invidious.esmailelbob.xyz",
+    "https://invidious.projectsegfau.lt",
 ]
 
 
@@ -34,16 +43,19 @@ INVIDIOUS_INSTANCES = [
 _ytdlp_updated = False
 async def _ensure_ytdlp_updated():
     global _ytdlp_updated
-    if _ytdlp_updated: return
+    if _ytdlp_updated:
+        return
     _ytdlp_updated = True
     loop = asyncio.get_event_loop()
     def _upd():
         try:
+            # Try both pip3 and pip, ignore failures
             subprocess.run(
-                ["pip","install","--upgrade","yt-dlp","--break-system-packages","-q"],
-                capture_output=True, timeout=60
+                ["pip3", "install", "--upgrade", "yt-dlp", "-q"],
+                capture_output=True, timeout=30
             )
-        except Exception: pass
+        except Exception:
+            pass
     await loop.run_in_executor(None, _upd)
 
 
@@ -238,7 +250,9 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
                     except: pass
                 return result, meta
         except Exception as e:
-            last_err = str(e); continue
+            last_err = str(e)
+            logger.warning(f"YouTube strategy failed: {last_err}")
+            continue
 
     if cookie_file:
         try: os.remove(cookie_file)
@@ -251,11 +265,13 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
         except Exception as e:
             last_err += f" | Invidious: {str(e)[:80]}"
 
+    # If all strategies failed, raise a detailed error
     raise RuntimeError(
-        "❌ **YouTube download failed.**\n\n"
-        "**Quick fix:** Delete Render service → create new (gets fresh IP)\n"
-        "**Permanent fix:** Set `YT_PROXY` (Webshare residential)\n\n"
-        f"`{last_err[:100]}`"
+        f"❌ **YouTube download failed.**\n\n"
+        f"**Error:** `{last_err[:200]}`\n\n"
+        f"**Quick fix:** Delete Render service → create new (gets fresh IP)\n"
+        f"**Permanent fix:** Set `YT_PROXY` (Webshare residential) and valid cookies.\n"
+        f"Use `/cookies` to check cookie status."
     )
 
 
