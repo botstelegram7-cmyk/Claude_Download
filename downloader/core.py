@@ -52,6 +52,30 @@ INVIDIOUS_INSTANCES = [
     "https://yt.artemislena.eu",
 ]
 
+# Terabox third-party APIs (expanded)
+_TERABOX_THIRD_PARTY_APIS = [
+    "https://teraboxdownloader.online/api/download?url=",
+    "https://terabox.udayscriptsx.workers.dev/?url=",
+    "https://tera.instavideosave.com/?url=",
+    "https://teradl-api.dapuntaratya.com/generate?url=",
+    "https://terabox-dl-api.vercel.app/api?url=",
+    "https://terabox.hnn.workers.dev/?url=",
+    "https://terabox.giize.com/?url=",
+    "https://terabox-video-downloader.vercel.app/api?url=",
+    "https://terabox.softor.net/api?url=",
+]
+
+_TERABOX_DOMAINS_API = [
+    "https://www.terabox.com",
+    "https://www.1024tera.com",
+    "https://teraboxapp.com",
+    "https://www.terabox.app",
+    "https://www.4funbox.com",
+    "https://www.mirrobox.com",
+    "https://www.nephobox.com",
+    "https://www.freeterabox.com",
+]
+
 
 # ── yt-dlp auto-update (force) ─────────────────────────────────────────────
 _ytdlp_updated = False
@@ -499,31 +523,7 @@ async def _scrape_video_host(url: str, out_dir: str, hook) -> tuple:
     return out_file, {"title": title or "Video", "ext": "mp4"}
 
 
-# ── Terabox (improved timeouts and APIs) ──────────────────────────────────
-_TERABOX_THIRD_PARTY_APIS = [
-    "https://teraboxdownloader.online/api/download?url=",
-    "https://terabox.udayscriptsx.workers.dev/?url=",
-    "https://tera.instavideosave.com/?url=",
-    "https://teradl-api.dapuntaratya.com/generate?url=",
-    "https://terabox-dl-api.vercel.app/api?url=",
-    "https://terabox.hnn.workers.dev/?url=",
-    "https://terabox.giize.com/?url=",
-    "https://terabox-video-downloader.vercel.app/api?url=",
-    "https://terabox.softor.net/api?url=",
-]
-
-_TERABOX_DOMAINS_API = [
-    "https://www.terabox.com",
-    "https://www.1024tera.com",
-    "https://teraboxapp.com",
-    "https://www.terabox.app",
-    "https://www.4funbox.com",
-    "https://www.mirrobox.com",
-    "https://www.nephobox.com",
-    "https://www.freeterabox.com",
-]
-
-
+# ── Terabox methods ────────────────────────────────────────────────────────
 def _extract_terabox_surl(url: str) -> Optional[str]:
     patterns = [
         r'[?&]surl=([a-zA-Z0-9_-]+)',
@@ -890,19 +890,19 @@ async def download_direct(url: str, out_dir: str, filename: str = None,
         "User-Agent": CHROME_UA,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "identity",  # avoid compression
+        "Accept-Encoding": "identity",
         "Connection": "keep-alive",
         "Referer": "/".join(url.split("/")[:3]) + "/",
         **(extra_headers or {})
     }
 
     async with aiohttp.ClientSession(headers=hdrs) as s:
-        async with s.get(url, timeout=aiohttp.ClientTimeout(total=60),
+        async with s.get(url, timeout=aiohttp.ClientTimeout(total=120),
                          allow_redirects=True) as resp:
             if resp.status in (403, 401):
                 # Try without Referer
                 hdrs2 = {k: v for k, v in hdrs.items() if k != "Referer"}
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=60),
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=120),
                                   headers=hdrs2, allow_redirects=True) as r2:
                     if r2.status in (403, 401):
                         raise RuntimeError(f"❌ {r2.status} — link expired.")
@@ -991,7 +991,8 @@ async def download_gdrive_folder(url, out_dir, progress_hook=None) -> tuple:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": False,
-        "retries": 3,
+        "retries": 5,  # increased retries
+        "socket_timeout": 60,
         "http_headers": {"User-Agent": CHROME_UA}
     }
     if cookie_file:
@@ -1021,6 +1022,7 @@ async def download_gdrive_folder(url, out_dir, progress_hook=None) -> tuple:
             raise RuntimeError("No files downloaded from Google Drive")
         return files, info
     except Exception as e:
+        logger.error(f"Google Drive download error: {e}")
         raise RuntimeError(f"Google Drive download failed: {e}")
     finally:
         if cookie_file and os.path.exists(cookie_file):
@@ -1028,7 +1030,7 @@ async def download_gdrive_folder(url, out_dir, progress_hook=None) -> tuple:
             except: pass
 
 
-# ── Thumbnails (unchanged) ────────────────────────────────────────────────
+# ── Thumbnails and helpers (unchanged) ────────────────────────────────────
 def download_thumb_from_url(thumb_url, video_id) -> Optional[str]:
     try:
         import requests as req
