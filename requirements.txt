@@ -1,8 +1,54 @@
-Pyrogram==2.0.106
-TgCrypto==1.2.5
-yt-dlp>=2025.1.1
-aiohttp>=3.9.0
-aiosqlite>=0.19.0
-Pillow>=10.0.0
-Flask>=3.0.0
-requests>=2.31.0
+# Core Telegram
+python-telegram-bot[all]==21.6
+
+# Web server
+aiohttp==3.9.5
+
+# PDF processing
+PyMuPDF==1.24.9
+pikepdf==9.2.1
+pdfplumber==0.11.4
+reportlab==4.2.2
+python-docx==1.1.2
+
+# PowerPoint
+python-pptx==1.0.2
+
+# Image processing
+Pillow==10.4.0
+
+# OCR
+pytesseract==0.3.13
+
+# Excel
+openpyxl==3.1.5
+
+# QR Code
+qrcode[pil]==7.4.2
+
+# Barcode
+python-barcode==0.15.1
+
+# Background removal (local AI, no API key)
+rembg==2.0.57
+onnxruntime==1.19.2
+
+# EPUB support
+EbookLib==0.18
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# HTML to PDF
+weasyprint==62.3
+
+# QR code scanning
+pyzbar==0.1.1
+
+# Environment variables
+python-dotenv==1.0.1
+
+# MongoDB (optional)
+motor==3.5.1
+
+# Numpy (for deskew)
+numpy==1.26.4

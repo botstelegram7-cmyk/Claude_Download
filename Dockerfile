@@ -1,32 +1,36 @@
-# ──────────────────────────────────────────────────────
-# Serena Downloader Bot — Dockerfile
-# ──────────────────────────────────────────────────────
-
+# ── PDF Doctor Bot v2.0 — Dockerfile ────────────────────────────────────────
+# GitHub: @SerenaXdev
 FROM python:3.11-slim
 
-# System dependencies + FFmpeg
+# System dependencies
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    curl \
-    git \
-    libmagic1 \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-hin \
+    libtesseract-dev \
+    ghostscript \
+    libgl1 \
+    libglib2.0-0 \
+    wget \
+    fonts-dejavu \
+    fontconfig \
     && rm -rf /var/lib/apt/lists/*
 
-# Working directory
 WORKDIR /app
 
-# Copy requirements first (layer cache)
+# ── Pre-create fonts dir (fonts downloaded at bot startup via requests) ──────
+RUN mkdir -p fonts data
+
+# ── Install Python packages ──────────────────────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy project
+# ── Copy source ──────────────────────────────────────────────────────────────
 COPY . .
 
-# Create runtime directories
-RUN mkdir -p /tmp/serena_db /tmp/serena_dl
-
-# Expose port for health check
 EXPOSE 8080
 
-# Start bot
-CMD ["python", "bot.py"]
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+CMD ["python", "main.py"]

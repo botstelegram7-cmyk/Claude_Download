@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  pdf-doctor-bot:
+    build: .
+    container_name: pdf_doctor_bot
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - OWNER_ID=${OWNER_ID}
+      - UPI_ID=${UPI_ID:-}
+      - UPI_QR_URL=${UPI_QR_URL:-}
+      - START_IMAGE=${START_IMAGE:-}
+      - MONGODB_URL=${MONGODB_URL:-}
+      - PORT=8080
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
