@@ -45,6 +45,8 @@ INVIDIOUS_INSTANCES = [
     "https://invidious.snopyta.org",
     "https://invidious.esmailelbob.xyz",
     "https://invidious.projectsegfau.lt",
+    "https://invidious.flokinet.to",
+    "https://invidious.tiekoetter.com",
 ]
 
 
@@ -286,6 +288,7 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
             return await _yt_via_invidious(vid_id, out_dir, quality, audio_only, hook)
         except Exception as e:
             last_err += f" | Invidious: {str(e)[:80]}"
+            logger.error(f"Invidious fallback failed: {e}")
 
     raise RuntimeError(
         f"❌ **YouTube download failed.**\n\n"
@@ -312,12 +315,16 @@ async def _yt_via_invidious(video_id: str, out_dir: str, quality: str,
                 async with s.get(api, timeout=aiohttp.ClientTimeout(total=15)) as r:
                     if r.status != 200: return None
                     return await r.json()
-        except Exception: return None
+        except Exception as e:
+            logger.debug(f"Invidious instance {base} failed: {e}")
+            return None
 
     data = None
     for inst in INVIDIOUS_INSTANCES:
         data = await _try(inst)
-        if data: break
+        if data:
+            logger.info(f"Using Invidious instance: {inst}")
+            break
 
     if not data:
         raise RuntimeError("All Invidious instances failed.")
@@ -484,18 +491,23 @@ async def _scrape_video_host(url: str, out_dir: str, hook) -> tuple:
 
 
 # ── Terabox ───────────────────────────────────────────────────────────────
-# Third-party APIs (no cookies needed — same as terabox bot)
+# Expanded third-party APIs
 _TERABOX_THIRD_PARTY_APIS = [
     "https://teraboxdownloader.online/api/download?url=",
     "https://terabox.udayscriptsx.workers.dev/?url=",
     "https://tera.instavideosave.com/?url=",
     "https://teradl-api.dapuntaratya.com/generate?url=",
+    "https://terabox-dl-api.vercel.app/api?url=",
+    "https://terabox.hnn.workers.dev/?url=",
+    "https://terabox.giize.com/?url=",
 ]
 
 _TERABOX_DOMAINS_API = [
     "https://www.terabox.com",
     "https://www.1024tera.com",
     "https://teraboxapp.com",
+    "https://www.terabox.app",
+    "https://www.4funbox.com",
 ]
 
 
@@ -531,7 +543,7 @@ def _terabox_third_party(url: str) -> tuple:
     for api in _TERABOX_THIRD_PARTY_APIS:
         try:
             api_url = api + quote(normalized, safe="")
-            r = req.get(api_url, timeout=20)
+            r = req.get(api_url, timeout=30)
             if r.status_code != 200: continue
             ct = r.headers.get("Content-Type","")
             data = r.json() if "json" in ct else {}
@@ -549,8 +561,10 @@ def _terabox_third_party(url: str) -> tuple:
                 "terabox_file"
             )
             if dl_url and dl_url.startswith("http"):
+                logger.info(f"Terabox third-party API success: {api}")
                 return dl_url, clean_filename(filename)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Terabox API {api} failed: {e}")
             continue
     return None, None
 
@@ -569,7 +583,7 @@ def _terabox_official_api(surl: str, cookie: str) -> tuple:
         for prefix in ["1", ""]:
             try:
                 api_url = f"{base}/api/shorturlinfo?shorturl={prefix}{surl}&root=1"
-                r = req.get(api_url, headers=headers, timeout=20)
+                r = req.get(api_url, headers=headers, timeout=30)
                 if r.status_code != 200: continue
                 data = r.json()
                 if data.get("errno") == 0:
@@ -578,7 +592,9 @@ def _terabox_official_api(surl: str, cookie: str) -> tuple:
                         first = file_list[0]
                         dlink = first.get("dlink","")
                         fname = first.get("server_filename") or first.get("filename") or "terabox_file"
-                        if dlink: return dlink, clean_filename(fname)
+                        if dlink:
+                            logger.info(f"Terabox official API success")
+                            return dlink, clean_filename(fname)
             except Exception:
                 continue
     return None, None
@@ -591,7 +607,7 @@ def _terabox_scrape(url: str, cookie: str = "") -> tuple:
         headers = {"User-Agent": CHROME_UA, "Accept": "text/html"}
         if cookie: headers["Cookie"] = cookie
         normalized = _normalize_terabox_url(url)
-        r = req.get(normalized, headers=headers, timeout=20)
+        r = req.get(normalized, headers=headers, timeout=30)
         text = r.text
         dlink = None
         for pat in [r'"dlink"\s*:\s*"([^"]+)"', r'"downloadLink"\s*:\s*"([^"]+)"']:
@@ -607,8 +623,11 @@ def _terabox_scrape(url: str, cookie: str = "") -> tuple:
                 fname = m.group(1).strip()
                 if fname and len(fname) > 2:
                     filename = clean_filename(fname); break
+        if dlink:
+            logger.info(f"Terabox scrape success")
         return dlink, filename
     except Exception as e:
+        logger.debug(f"Terabox scrape failed: {e}")
         return None, "terabox_file"
 
 
@@ -718,6 +737,7 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
     try:
         dl_url, filename = await loop.run_in_executor(None, _terabox_third_party, url)
         if dl_url:
+            logger.info("Terabox method 1 success (third-party API)")
             return await _terabox_download_file(dl_url, filename or "terabox_file.mp4",
                                                  out_dir, cookie_str, hook)
     except Exception as e:
@@ -730,6 +750,7 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
                 None, _terabox_official_api, surl, cookie_str
             )
             if dl_url:
+                logger.info("Terabox method 2 success (official API)")
                 return await _terabox_download_file(dl_url, filename or "terabox_file.mp4",
                                                      out_dir, cookie_str, hook)
         except Exception as e:
@@ -741,6 +762,7 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
             None, _terabox_scrape, url, cookie_str
         )
         if dl_url:
+            logger.info("Terabox method 3 success (scrape)")
             return await _terabox_download_file(dl_url, filename or "terabox_file.mp4",
                                                  out_dir, cookie_str, hook)
     except Exception as e:
@@ -752,13 +774,21 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
         "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
         "merge_output_format": "mp4",
         "quiet": True, "no_warnings": True,
-        "retries": 2, "socket_timeout": 25,
+        "retries": 3, "socket_timeout": 30,
         "http_headers": {"User-Agent": CHROME_UA},
     }
     if cookie_file: base["cookiefile"] = cookie_file
     if hook: base["progress_hooks"] = [hook]
 
-    for opts in ([{**base,"proxy":YT_PROXY},base] if YT_PROXY else [base]):
+    # Try with proxy first if available
+    if YT_PROXY:
+        proxy_opts = base.copy()
+        proxy_opts["proxy"] = YT_PROXY
+        strategies_ydl = [proxy_opts, base]
+    else:
+        strategies_ydl = [base]
+
+    for opts in strategies_ydl:
         def _run(o=opts):
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -770,7 +800,9 @@ async def _terabox_download(url, out_dir, cookie_file, hook) -> tuple:
                 return _find_file(out_dir, info, ydl), info
         try:
             result, meta = await loop.run_in_executor(None, _run)
-            if result: return result, meta
+            if result:
+                logger.info("Terabox method 4 success (yt-dlp)")
+                return result, meta
         except Exception as e:
             last_err += f" | ytdlp: {str(e)[:60]}"; continue
 
@@ -949,27 +981,47 @@ async def download_m3u8(url: str, out_dir: str, progress_hook=None) -> tuple:
         raise RuntimeError("⏱ Stream timed out.")
 
 
-# ── Google Drive folder ───────────────────────────────────────────────────
+# ── Google Drive folder (with cookie support) ─────────────────────────────
 async def download_gdrive_folder(url, out_dir, progress_hook=None) -> tuple:
     import yt_dlp
+    from config import GDRIVE_COOKIES
     os.makedirs(out_dir, exist_ok=True)
-    opts = {"format":"best","outtmpl":os.path.join(out_dir,"%(title).80s.%(ext)s"),
-            "quiet":True,"no_warnings":True,"noplaylist":False,
-            "retries":3,"http_headers":{"User-Agent":CHROME_UA}}
-    if progress_hook: opts["progress_hooks"] = [progress_hook]
+
+    cookie_file = _write_cookie_file(GDRIVE_COOKIES, "gdrive") if GDRIVE_COOKIES else None
+    opts = {
+        "format": "best",
+        "outtmpl": os.path.join(out_dir, "%(title).80s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": False,
+        "retries": 3,
+        "http_headers": {"User-Agent": CHROME_UA}
+    }
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
+        logger.info(f"Using Google Drive cookies from {cookie_file}")
+    if progress_hook:
+        opts["progress_hooks"] = [progress_hook]
+
     loop = asyncio.get_event_loop()
     def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-        skip={".part",".ytdl",".tmp"}
-        files=sorted([
-            os.path.join(out_dir,x) for x in os.listdir(out_dir)
-            if os.path.isfile(os.path.join(out_dir,x))
+        skip = {".part", ".ytdl", ".tmp"}
+        files = sorted([
+            os.path.join(out_dir, x) for x in os.listdir(out_dir)
+            if os.path.isfile(os.path.join(out_dir, x))
             and not any(x.endswith(e) for e in skip)
-            and os.path.getsize(os.path.join(out_dir,x))>0
+            and os.path.getsize(os.path.join(out_dir, x)) > 0
         ], key=os.path.getmtime)
         return files, info
-    return await loop.run_in_executor(None, _run)
+
+    try:
+        return await loop.run_in_executor(None, _run)
+    finally:
+        if cookie_file and os.path.exists(cookie_file):
+            try: os.remove(cookie_file)
+            except: pass
 
 
 # ── Thumbnails ────────────────────────────────────────────────────────────
