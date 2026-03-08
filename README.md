@@ -1,101 +1,160 @@
-# 🤖 Nexora PDF Doctor Bot v3.0
+# ⋆｡° ✮ Serena Downloader Bot ✮ °｡⋆
 
-A powerful all-in-one Telegram PDF toolkit with 30+ features.
+> **@Universal_DownloadBot** — A production-ready Telegram media downloader bot
 
-## 🆕 What's New in v3.0
+»»──── ✦ ────««
 
-### New Features
-| Command | Feature | Plan |
-|---------|---------|------|
-| `/pdf2word` | PDF → Editable DOCX | 🥈 Basic |
-| `/pdf2ppt` | PDF → PowerPoint Slides | 🥇 Pro |
-| `/crop` | Auto-crop white margins | ✅ Free |
-| `/qr` | QR Code Generator | ✅ Free |
-| `/delete_pages` | Delete specific pages | ✅ Free (5 pages max) / 🥇 Pro |
-| `/reorder` | Reorder pages (e.g., 3,1,2) | ✅ Free |
-| `/lang` | Change bot language | ✅ Free |
+## Overview
 
-### Improvements
-- ✅ **OCR now asks language** before extraction (English, Hindi, Spanish, French, Korean, etc.)
-- ✅ **6 Bot Languages**: English, Hindi, Bhojpuri, Spanish, French, Korean
-- ✅ **14 Handwriting Fonts** (6 new added)
-- ✅ **8 Notebook Styles**: Blue Lines, Yellow Legal, Graph, Dotted, Parchment, Dark, Pink Diary, Chalkboard
-- ✅ **Fixed Handwriting Alignment**: Text now sits perfectly ON the ruled lines
+Serena Downloader Bot is a fully-featured Telegram bot that downloads media from virtually any platform, built with Python 3.11, Pyrogram, and yt-dlp.
 
-## 📋 All Features
+## ✨ Features
 
-### 📄 PDF Tools
-- `/compress` - Compress PDF (multi-strategy)
-- `/split` - Split into individual pages
-- `/merge` - Merge multiple PDFs
-- `/repair` - Fix corrupted PDFs
+- **Multi-Platform Downloads** — YouTube, Instagram, TikTok, Twitter/X, Facebook, Google Drive, Terabox, M3U8, Direct links
+- **Quality Selector** — 144p / 360p / 720p / 1080p / Audio Only / Best
+- **Async Queue System** — Per-user download queue with real-time progress
+- **Subscription Plans** — Free / Basic / Premium / Owner tiers
+- **Bulk Downloads** — Send a `.txt` file with multiple URLs
+- **Auto Reactions** — Bot randomly reacts to messages with emojis
+- **Cookies Support** — YouTube, Instagram, Terabox cookies via env vars
+- **Admin Panel** — Full admin command suite
+- **Render.com Ready** — Deploy with one click
 
-### 🔐 Security
-- `/lock` - Password protect PDF
-- `/unlock` - Remove PDF password
+## 🚀 Deployment
 
-### 🎨 Visual
-- `/watermark` - Text/Logo/Invisible watermark
-- `/darkmode` - Dark mode conversion
-- `/bgchange` - Background color changer (8 themes)
+### Prerequisites
+- Python 3.11+
+- FFmpeg installed
+- Telegram Bot Token from [@BotFather](https://t.me/BotFather)
+- Telegram API credentials from [my.telegram.org](https://my.telegram.org)
 
-### 🔄 Convert
-- `/pdf2img` - PDF to PNG images
-- `/img2pdf` - Images to PDF
-- `/excel` - PDF to Excel
-- `/pdf2word` - PDF to Word DOCX ✨
-- `/pdf2ppt` - PDF to PowerPoint ✨
-
-### ✨ Creative
-- `/handwrite` - Handwritten PDF (14 fonts, 8 notebook styles)
-- `/addtext` - Add text to PDF
-- `/footer` - Add footer to all pages
-- `/pagenos` - Add page numbers
-- `/crop` - Crop white margins ✨
-- `/qr` - QR Code generator ✨
-
-### 🔍 Extract & Pages
-- `/ocr` - OCR with language selection (10 languages)
-- `/extract` - Extract page range
-- `/delete_pages` - Delete pages ✨
-- `/reorder` - Reorder pages ✨
-- `/metadata` - View PDF metadata
-
-### ⚙️ Tools
-- `/rotate` - Rotate (90°, 180°, Auto-fix)
-- `/resize` - Resize to A4
-
-### 🌍 Languages
-- `/lang` - English, Hindi, Bhojpuri, Spanish, French, Korean ✨
-
-## 🚀 Setup
+### Local Setup
 
 ```bash
-# Clone and install
+# 1. Clone / unzip the project
+cd serena_bot
+
+# 2. Install dependencies
 pip install -r requirements.txt
 
-# Set environment variables
-BOT_TOKEN=your_bot_token
-OWNER_ID=your_telegram_id
-UPI_ID=your_upi_id  # optional
-MONGODB_URL=your_mongodb_url  # optional, uses SQLite if empty
+# 3. Configure environment
+cp .env.example .env
+# Edit .env with your credentials
 
-# Run
-python main.py
+# 4. Run the bot
+python bot.py
 ```
 
-## 🐳 Docker
+### Docker
 
 ```bash
-docker-compose up -d
+docker build -t serena-bot .
+docker run --env-file .env serena-bot
 ```
 
-## 💎 Plans
+### Render.com
 
-| Feature | Free | Basic (₹99/mo) | Pro (₹249/yr) |
-|---------|------|----------------|----------------|
-| Daily operations | 3 | 50 | Unlimited |
-| PDF → Word | ✅ | ✅ | ✅ |
-| PDF → PPT | ❌ | ❌ | ✅ |
-| Delete pages | 5 max | 20 max | Unlimited |
-| OCR languages | 3 | All | All |
+1. Push this project to a GitHub repository
+2. Go to [render.com](https://render.com) → New → Web Service
+3. Connect your repo
+4. Set environment variables (BOT_TOKEN, API_ID, API_HASH)
+5. Deploy!
+
+The `render.yaml` file handles all configuration automatically.
+
+## ⚙️ Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `BOT_TOKEN` | ✅ | Your Telegram bot token |
+| `API_ID` | ✅ | Telegram API ID |
+| `API_HASH` | ✅ | Telegram API hash |
+| `OWNER_IDS` | ✅ | Comma-separated owner Telegram IDs |
+| `FREE_LIMIT` | — | Daily downloads for free users (default: 3) |
+| `BASIC_LIMIT` | — | Daily downloads for basic users (default: 15) |
+| `PREMIUM_LIMIT` | — | Daily downloads for premium users (default: 50) |
+| `YT_COOKIES` | — | YouTube cookies in Netscape format |
+| `INSTAGRAM_COOKIES` | — | Instagram cookies in Netscape format |
+| `TERABOX_COOKIES` | — | Terabox cookies in Netscape format |
+| `PORT` | — | Web server port (default: 8080) |
+
+## 📋 Commands
+
+### User Commands
+| Command | Description |
+|---|---|
+| `/start` | Welcome message |
+| `/help` | Help guide |
+| `/ping` | Check bot latency |
+| `/status` | Bot status |
+| `/plans` | Subscription plans |
+| `/mystats` | Your download stats |
+| `/history` | Recent downloads |
+| `/settings` | Bot settings |
+| `/audio [url]` | Extract audio |
+| `/info [url]` | Media information |
+| `/queue` | View queue status |
+| `/cancel` | Cancel pending selection |
+| `/feedback [text]` | Send feedback |
+
+### Admin Commands (Owner only)
+| Command | Description |
+|---|---|
+| `/givepremium <id> <plan>` | Grant premium plan |
+| `/removepremium <id>` | Remove premium plan |
+| `/ban <id>` | Ban a user |
+| `/unban <id>` | Unban a user |
+| `/broadcast <message>` | Broadcast to all users |
+| `/stats` | Bot statistics |
+| `/users` | List all users |
+| `/banned` | List banned users |
+| `/restart` | Restart the bot |
+
+## 🍪 Cookie Setup
+
+To use age-restricted or region-locked content:
+
+1. Install a browser extension like "Get cookies.txt LOCALLY"
+2. Visit YouTube/Instagram while logged in
+3. Export cookies in **Netscape format**
+4. Paste the entire content as the `YT_COOKIES` environment variable on Render
+
+## 📁 Project Structure
+
+```
+serena_bot/
+├── bot.py              # Main entry point
+├── client.py           # Pyrogram client
+├── config.py           # Configuration
+├── database.py         # SQLite database layer
+├── queue_manager.py    # Async download queue
+├── plugins/
+│   ├── start.py        # User commands
+│   ├── download.py     # Download handler
+│   ├── admin.py        # Admin commands
+│   └── reactions.py    # Auto emoji reactions
+├── downloader/
+│   ├── core.py         # yt-dlp / ffmpeg core
+│   └── media.py        # Upload pipeline
+├── utils/
+│   ├── helpers.py      # Utility functions
+│   ├── progress.py     # Progress tracking
+│   └── decorators.py   # Auth decorators
+├── web/
+│   └── app.py          # Flask health server
+├── Dockerfile
+├── render.yaml
+├── requirements.txt
+├── .env.example
+└── sample_urls.txt
+```
+
+## 👤 Credits
+
+- **Owner:** @Xioqui_Xan
+- **Support:** @TechnicalSerena
+- **Bot:** @Universal_DownloadBot
+
+»»──── ✦ ────««
+
+⋆ ｡˚ Made with ❤️ ˚｡ ⋆
