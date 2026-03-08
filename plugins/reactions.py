@@ -1,6 +1,6 @@
 """
 Serena Bot - Auto Reactions
-Fixed: Only works in private chats to avoid BOT_METHOD_INVALID in groups.
+Fixed: Only works in private chats, uses simple emoji strings.
 """
 import random
 import asyncio
@@ -31,6 +31,7 @@ async def auto_react(client: Client, message):
         await asyncio.sleep(random.uniform(1.5, 4.0))
         emoji = random.choice(EMOJIS)
 
+        # Ensure emoji is a simple string
         await client.send_reaction(
             chat_id=message.chat.id,
             message_id=message.id,
