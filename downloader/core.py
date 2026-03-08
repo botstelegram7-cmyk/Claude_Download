@@ -49,7 +49,6 @@ async def _ensure_ytdlp_updated():
     loop = asyncio.get_event_loop()
     def _upd():
         try:
-            # Try both pip3 and pip, ignore failures
             subprocess.run(
                 ["pip3", "install", "--upgrade", "yt-dlp", "-q"],
                 capture_output=True, timeout=30
@@ -59,27 +58,35 @@ async def _ensure_ytdlp_updated():
     await loop.run_in_executor(None, _upd)
 
 
-# ── Cookie file writer ─────────────────────────────────────────────────────
+# ── Cookie file writer with validation ─────────────────────────────────────
 def _write_cookie_file(raw: str, prefix: str) -> Optional[str]:
-    if not raw or not raw.strip(): return None
+    if not raw or not raw.strip():
+        return None
     content = raw.strip().strip('"').strip("'")
     content = content.replace("\\n", "\n").replace("\\t", "\t")
     content = content.replace("\r\n", "\n").replace("\r", "\n")
     lines = content.split("\n")
+    # Validate that at least one line looks like a valid cookie
     has_cookie = any(
         len(l.split("\t")) >= 7 and not l.startswith("#")
         for l in lines if l.strip()
     )
-    if not has_cookie: return None
+    if not has_cookie:
+        logger.warning(f"Cookie content for {prefix} has no valid entries")
+        return None
     try:
         path = f"/tmp/{prefix}_ck_{os.getpid()}.txt"
         with open(path, "w", encoding="utf-8") as f:
             if "# Netscape" not in content:
                 f.write("# Netscape HTTP Cookie File\n\n")
             f.write(content)
-            if not content.endswith("\n"): f.write("\n")
+            if not content.endswith("\n"):
+                f.write("\n")
+        logger.debug(f"Cookies written to {path}")
         return path
-    except Exception: return None
+    except Exception as e:
+        logger.error(f"Failed to write cookie file: {e}")
+        return None
 
 
 async def check_yt_cookies_status() -> dict:
@@ -91,7 +98,7 @@ async def check_yt_cookies_status() -> dict:
     path = _write_cookie_file(YT_COOKIES, "yt_check")
     if not path:
         return {"valid": False, "expired": False,
-                "message": "❌ Cookie content invalid."}
+                "message": "❌ Cookie content invalid (no valid entries)."}
     now = int(time.time()); valid = expired = 0; nearest = None
     try:
         with open(path) as f:
@@ -142,7 +149,7 @@ def _find_file(out_dir: str, info: Optional[dict], ydl) -> Optional[str]:
     except Exception: return None
 
 
-# ── YouTube — EMBED CLIENTS FIRST (same as Telegram inline player) ─────────
+# ── YouTube — EMBED CLIENTS FIRST ──────────────────────────────────────────
 async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
     import yt_dlp
     from config import YT_COOKIES, YT_PROXY
@@ -162,6 +169,8 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
     }.get(quality, "best[ext=mp4]/best")
 
     cookie_file = _write_cookie_file(YT_COOKIES, "yt") if YT_COOKIES else None
+    if cookie_file:
+        logger.info(f"YouTube cookies loaded from {cookie_file}")
 
     def _make(player_clients: list, extra_ea: dict = {}):
         ea = {
@@ -180,36 +189,34 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
             "http_headers": {"User-Agent": CHROME_UA},
             "extractor_args": ea,
         }
-        if YT_PROXY:    o["proxy"] = YT_PROXY
-        if cookie_file: o["cookiefile"] = cookie_file
+        if YT_PROXY:
+            o["proxy"] = YT_PROXY
+            logger.debug(f"Using proxy: {YT_PROXY}")
+        if cookie_file:
+            o["cookiefile"] = cookie_file
         if audio_only:
             o["postprocessors"] = [{"key": "FFmpegExtractAudio",
                                      "preferredcodec": "mp3", "preferredquality": "192"}]
-        if hook: o["progress_hooks"] = [hook]
+        if hook:
+            o["progress_hooks"] = [hook]
         return o
 
     # ── Strategy order: embed clients FIRST ──────────────────────────────
-    # web_embedded & tv_embedded = same clients Telegram uses for inline embed
-    # These bypass bot detection AND age-restriction (error 152) on most IPs
     strategies = [
-        # Tier 1: Embed clients — bypass bot check + age-restriction
         _make(["web_embedded"]),
         _make(["tv_embedded"]),
         _make(["web_embedded", "tv_embedded"]),
-        # Tier 1b: Age-bypass — use embed with cookies (best combo for error 152)
         _make(["tv_embedded", "web_embedded"]),
-        # Tier 2: Mobile clients
         _make(["android"], {"youtube": {"player_client": ["android"],
                                          "player_skip": ["webpage","configs"]}}),
         _make(["android_vr"], {"youtube": {"player_client": ["android_vr"],
                                             "player_skip": ["webpage","configs"]}}),
         _make(["ios"], {"youtube": {"player_client": ["ios"],
                                      "player_skip": ["webpage","configs"]}}),
-        # Tier 3: Other clients
         _make(["mediaconnect"]),
         _make(["mweb"]),
         _make(["android_testsuite"]),
-        # Tier 4: Default (no client override)
+        # Default fallback
         {
             "format": fmt,
             "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
@@ -232,7 +239,7 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
     loop = asyncio.get_event_loop()
     last_err = ""
 
-    for opts in strategies:
+    for idx, opts in enumerate(strategies):
         def _run(o=opts):
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -243,15 +250,17 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
                     return [r for r in res if r] or None, info
                 return _find_file(out_dir, info, ydl), info
         try:
+            logger.debug(f"Trying YouTube strategy #{idx+1}")
             result, meta = await loop.run_in_executor(None, _run)
             if result:
+                logger.info(f"YouTube download succeeded with strategy #{idx+1}")
                 if cookie_file:
                     try: os.remove(cookie_file)
                     except: pass
                 return result, meta
         except Exception as e:
             last_err = str(e)
-            logger.warning(f"YouTube strategy failed: {last_err}")
+            logger.warning(f"YouTube strategy #{idx+1} failed: {last_err[:150]}")
             continue
 
     if cookie_file:
@@ -261,11 +270,11 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
     # ── Invidious fallback ──────────────────────────────────────────────
     if vid_id:
         try:
+            logger.info("Trying Invidious fallback...")
             return await _yt_via_invidious(vid_id, out_dir, quality, audio_only, hook)
         except Exception as e:
             last_err += f" | Invidious: {str(e)[:80]}"
 
-    # If all strategies failed, raise a detailed error
     raise RuntimeError(
         f"❌ **YouTube download failed.**\n\n"
         f"**Error:** `{last_err[:200]}`\n\n"
