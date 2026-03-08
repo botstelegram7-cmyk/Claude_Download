@@ -24,6 +24,7 @@ DL_DIR: str  = os.environ.get("DL_DIR",  "/tmp/serena_dl")
 YT_COOKIES: str        = os.environ.get("YT_COOKIES", "")
 INSTAGRAM_COOKIES: str = os.environ.get("INSTAGRAM_COOKIES", "")
 TERABOX_COOKIES: str   = os.environ.get("TERABOX_COOKIES", "")
+GDRIVE_COOKIES: str = os.environ.get("GDRIVE_COOKIES", "")
 
 # Webshare rotating proxy — http://user-rotate:pass@p.webshare.io:80
 YT_PROXY: str = os.environ.get("YT_PROXY", "")
