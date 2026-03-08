@@ -2,7 +2,7 @@
 Serena Bot - Auto Reactions
 Pyrogram 2.0.106 — tested working method
 """
-import random, asyncio, os, sys
+import random, asyncio, os, sys, logging
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
@@ -11,6 +11,8 @@ if _root not in sys.path:
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait
+
+logger = logging.getLogger("SerenaBot.Reactions")
 
 REACT_CHANCE = 0.60
 EMOJIS = ["👍","❤️","🔥","🎉","😍","👏","🤩","💯","⚡","🌟","🎵","🎬","💎","🚀","🙌","😎"]
@@ -36,7 +38,10 @@ async def auto_react(client: Client, message: Message):
             message_id=message.id,
             emoji=emoji,
         )
+        logger.debug(f"Reacted to message {message.id} with {emoji}")
     except FloodWait as e:
+        logger.warning(f"Flood wait {e.value}s for reaction")
         await asyncio.sleep(e.value + 2)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Reaction error: {e}")
         pass  # reactions are optional, never crash bot
