@@ -89,12 +89,27 @@ async def main():
         f"  Status  : 🟢 Online\n"
     )
 
+    # ── Async keep-alive: periodic no-op to prevent event loop stall ──
+    async def _keepalive():
+        while True:
+            try:
+                await asyncio.sleep(300)          # every 5 min
+                _ = await app.get_me()            # lightweight Telegram API call
+                logger.debug("🔄 Keep-alive ping OK")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Keep-alive error: {e}")
+
+    ka_task = asyncio.create_task(_keepalive())
+
     # ── Keep alive ──
     try:
         await asyncio.Event().wait()
     except (KeyboardInterrupt, SystemExit):
         logger.info("🛑 Shutting down...")
     finally:
+        ka_task.cancel()
         await app.stop()
         logger.info("👋 Bot stopped.")
 
