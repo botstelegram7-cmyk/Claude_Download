@@ -20,7 +20,7 @@ import database as db
 from utils.decorators import not_banned, ensure_registered
 from utils.helpers import is_valid_url, detect_url_type
 from queue_manager import queue_manager, DownloadJob
-from downloader.media import process_download, handle_gdrive_choice
+from downloader.media import process_download, handle_gdrive_choice, handle_large_file_choice
 from config import PLANS, OWNER_IDS, QUEUE_DELAY
 import config as _cfg
 
@@ -533,6 +533,15 @@ async def info_dl_cb(client: Client, query: CallbackQuery):
 async def cancel_cmd(client: Client, message: Message):
     _pending_urls.pop(message.from_user.id, None)
     await message.reply_text("❌ **Cancelled.**")
+
+
+# ── Large file choice callback ─────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^lf:"))
+async def large_file_cb(client: Client, query: CallbackQuery):
+    await query.answer()
+    choice = query.data.split(":",1)[1]
+    await handle_large_file_choice(client, query, choice)
 
 
 # ── Bulk .txt ─────────────────────────────────────────────────────────────
