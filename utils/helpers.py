@@ -118,55 +118,67 @@ def get_title_from_url(url: str) -> str:
 
 
 def detect_url_type(url: str) -> str:
-    u = url.lower()
+    u    = url.lower()
     path = url.split("?")[0].lower()
 
     # Social / video platforms
-    if re.search(r"(youtube\.com|youtu\.be)", u):                 return "youtube"
-    if re.search(r"instagram\.com", u):                            return "instagram"
-    if re.search(r"(tiktok\.com|vm\.tiktok)", u):                 return "tiktok"
-    if re.search(r"(twitter\.com|x\.com|t\.co)", u):              return "twitter"
-    if re.search(r"(facebook\.com|fb\.watch)", u):                 return "facebook"
+    if re.search(r"(youtube\.com|youtu\.be)", u):                  return "youtube"
+    if re.search(r"instagram\.com", u):                             return "instagram"
+    if re.search(r"(tiktok\.com|vm\.tiktok|vt\.tiktok)", u):      return "tiktok"
+    if re.search(r"(twitter\.com|x\.com|t\.co)", u):               return "twitter"
+    if re.search(r"(facebook\.com|fb\.watch|fb\.com)", u):         return "facebook"
+    if re.search(r"(reddit\.com|v\.redd\.it)", u):                 return "generic"
+    if re.search(r"(twitch\.tv|clips\.twitch\.tv)", u):            return "generic"
+    if re.search(r"(vimeo\.com)", u):                               return "generic"
+    if re.search(r"(dailymotion\.com|dai\.ly)", u):                 return "generic"
+    if re.search(r"(soundcloud\.com)", u):                          return "generic"
+    if re.search(r"(pinterest\.com|pin\.it)", u):                   return "generic"
+    if re.search(r"(snapchat\.com)", u):                            return "generic"
 
     # Google Drive (normal)
-    if re.search(r"drive\.google\.com", u):                        return "gdrive"
+    if re.search(r"drive\.google\.com", u):                         return "gdrive"
 
     # Google Cloud Storage — treat as direct downloadable file
-    if re.search(r"storage\.googleapis\.com", u):                  return "direct_doc"
+    if re.search(r"storage\.googleapis\.com", u):                   return "direct_doc"
 
     # Terabox — all domains
-    if any(d in u for d in TERABOX_DOMAINS):                       return "terabox"
+    if any(d in u for d in TERABOX_DOMAINS):                        return "terabox"
 
     # M3U8 streams
-    if re.search(r"\.m3u8", u):                                    return "m3u8"
+    if re.search(r"\.m3u8", u):                                     return "m3u8"
 
-    # ── Direct file detection — check path extension ──
+    # ── Direct file detection — check path extension (expanded) ──
     # Video
-    if re.search(r"\.(mp4|mkv|webm|avi|mov|flv|ts|3gp|m4v|wmv)(\?|$|/)", path):
+    if re.search(r"\.(mp4|mkv|webm|avi|mov|flv|ts|m2ts|3gp|m4v|wmv|rm|rmvb|vob|ogv)(\?|$|#)", path):
         return "direct_video"
     # Audio
-    if re.search(r"\.(mp3|aac|flac|wav|ogg|m4a|opus|wma)(\?|$|/)", path):
+    if re.search(r"\.(mp3|aac|flac|wav|ogg|m4a|opus|wma|aiff|alac|amr|au)(\?|$|#)", path):
         return "direct_audio"
     # Image
-    if re.search(r"\.(jpg|jpeg|png|gif|webp|bmp|tiff)(\?|$|/)", path):
+    if re.search(r"\.(jpg|jpeg|png|gif|webp|bmp|tiff|svg|ico|heic|avif)(\?|$|#)", path):
         return "direct_image"
-    # Document / archive
-    if re.search(r"\.(pdf|doc|docx|zip|rar|tar|7z|epub|ppt|pptx|xls|xlsx)(\?|$|/)", path):
+    # Archive / binary / app
+    if re.search(r"\.(zip|rar|tar|7z|gz|bz2|xz|apk|xapk|exe|dmg|pkg|iso|bin|msi|deb|rpm)(\?|$|#)", path):
+        return "direct_doc"
+    # Document
+    if re.search(r"\.(pdf|doc|docx|epub|ppt|pptx|xls|xlsx|odt|ods|odp|txt|csv|json|xml)(\?|$|#)", path):
         return "direct_doc"
 
-    # ── Fallback: check ?title= param for extension ──
-    title_m = re.search(r"[?&]title=([^&]+)", url)
-    if title_m:
-        t = unquote(title_m.group(1)).lower()
-        if re.search(r"\.(mp4|mkv|webm|avi|mov|flv|ts)", t):  return "direct_video"
-        if re.search(r"\.(mp3|aac|flac|wav|m4a|opus)", t):    return "direct_audio"
-        if re.search(r"\.(jpg|jpeg|png|gif|webp)", t):         return "direct_image"
-        if re.search(r"\.(pdf|zip|rar|doc|docx|epub)", t):     return "direct_doc"
+    # ── Fallback: check ?title= or ?filename= param for extension ──
+    for param in ("title", "filename", "name", "file"):
+        m = re.search(rf"[?&]{param}=([^&]+)", url)
+        if m:
+            t = unquote(m.group(1)).lower()
+            if re.search(r"\.(mp4|mkv|webm|avi|mov|flv|ts|m2ts|3gp)", t):  return "direct_video"
+            if re.search(r"\.(mp3|aac|flac|wav|m4a|opus|ogg)", t):           return "direct_audio"
+            if re.search(r"\.(jpg|jpeg|png|gif|webp|bmp)", t):                return "direct_image"
+            if re.search(r"\.(apk|exe|dmg|zip|rar|7z|iso)", t):              return "direct_doc"
+            if re.search(r"\.(pdf|zip|rar|doc|docx|epub)", t):               return "direct_doc"
 
     # ── CDN / download path patterns ──
-    if re.search(r"/(download|dl|file|get|fetch|tmp|recycle)/", u):
-        # Looks like a direct download path
-        if re.search(r"(\.mp4|video|vid)", u): return "direct_video"
+    if re.search(r"/(download|dl|file|get|fetch|tmp|recycle|attach|attachment)/", u):
+        if re.search(r"(\.mp4|video|vid|\.mkv|\.webm)", u):         return "direct_video"
+        if re.search(r"(\.mp3|audio|music|\.m4a)", u):              return "direct_audio"
         return "direct_doc"
 
     return "generic"
