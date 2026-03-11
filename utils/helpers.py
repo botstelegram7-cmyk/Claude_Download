@@ -138,6 +138,9 @@ def detect_url_type(url: str) -> str:
     # Google Drive (normal)
     if re.search(r"drive\.google\.com", u):                         return "gdrive"
 
+    # googlevideo.com — YouTube CDN direct MP4 links (touch-to-download)
+    if re.search(r"googlevideo\.com", u):                           return "direct_video"
+
     # Google Cloud Storage — treat as direct downloadable file
     if re.search(r"storage\.googleapis\.com", u):                   return "direct_doc"
 
