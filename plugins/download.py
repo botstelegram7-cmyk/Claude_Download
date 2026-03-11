@@ -1,10 +1,11 @@
 """
 Serena Bot - Download Handler
-- Quality selector only for YouTube
-- Pin message on queue start, reply to pin for delivery
-- Queue delay between jobs
-- Encrypted M3U8 support
-- Metadata caption: platform name, no source URL
+- Dynamic quality selector for YouTube (fetches actual available formats)
+- APK/ZIP → no quality prompt, direct download
+- Queue: 1st download completes before 2nd starts
+- Upload progress shown (fixed coroutine bug)
+- Thumbnail from original source
+- More format support
 """
 import os, sys, asyncio, re
 
@@ -23,7 +24,7 @@ from downloader.media import process_download, handle_gdrive_choice
 from config import PLANS, OWNER_IDS, QUEUE_DELAY
 import config as _cfg
 
-B = "▸"
+B  = "▸"
 LN = "─" * 22
 
 _pending_urls: dict = {}
@@ -38,7 +39,9 @@ _CMDS = [
 # Platforms that support quality selection
 _QUALITY_PLATFORMS = {"youtube"}
 
-# Platform display names for caption
+# APK/archive extensions — skip quality prompt
+_ARCHIVE_EXTS = {"zip","rar","tar","7z","apk","exe","dmg","iso","bin","pkg","xapk"}
+
 _PLATFORM_NAMES = {
     "youtube":      "YouTube",
     "instagram":    "Instagram",
@@ -86,47 +89,102 @@ async def _guard(message: Message, user_id: int) -> bool:
     return True
 
 
-def _quality_kb() -> InlineKeyboardMarkup:
+def _default_quality_kb() -> InlineKeyboardMarkup:
+    """Fallback fixed quality keyboard."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("144p",     callback_data="dl_q:144p"),
          InlineKeyboardButton("360p",     callback_data="dl_q:360p"),
-         InlineKeyboardButton("720p",     callback_data="dl_q:720p")],
-        [InlineKeyboardButton("1080p",    callback_data="dl_q:1080p"),
+         InlineKeyboardButton("480p",     callback_data="dl_q:480p")],
+        [InlineKeyboardButton("720p HD",  callback_data="dl_q:720p"),
+         InlineKeyboardButton("1080p FHD",callback_data="dl_q:1080p"),
+         InlineKeyboardButton("1440p 2K", callback_data="dl_q:1440p")],
+        [InlineKeyboardButton("4K",       callback_data="dl_q:2160p"),
          InlineKeyboardButton("🎵 Audio", callback_data="dl_q:audio"),
          InlineKeyboardButton("✨ Best",  callback_data="dl_q:best")],
         [InlineKeyboardButton("❌ Cancel", callback_data="dl_q:cancel")],
     ])
 
 
+async def _fetch_yt_formats(url: str) -> list:
+    """
+    Fetch available video heights from yt-dlp.
+    Returns list of heights like [144, 360, 720, 1080] sorted ascending.
+    """
+    try:
+        import yt_dlp
+        loop = asyncio.get_event_loop()
+        def _run():
+            opts = {"quiet":True,"no_warnings":True,"skip_download":True}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if not info:
+                    return []
+                fmts = info.get("formats") or []
+                heights = set()
+                for f in fmts:
+                    h = f.get("height")
+                    if h and isinstance(h, int) and h >= 144:
+                        heights.add(h)
+                return sorted(heights)
+        return await asyncio.wait_for(loop.run_in_executor(None, _run), timeout=15)
+    except Exception:
+        return []
+
+
+def _dynamic_quality_kb(heights: list) -> InlineKeyboardMarkup:
+    """Build quality keyboard from available heights."""
+    # Map height → label
+    labels = {
+        144:"144p", 240:"240p", 360:"360p", 480:"480p",
+        720:"720p HD", 1080:"1080p FHD", 1440:"1440p 2K", 2160:"4K",
+        4320:"8K"
+    }
+    buttons = []
+    row = []
+    for h in heights:
+        label = labels.get(h, f"{h}p")
+        row.append(InlineKeyboardButton(label, callback_data=f"dl_q:{h}p"))
+        if len(row) == 3:
+            buttons.append(row); row = []
+    if row:
+        buttons.append(row)
+    # Always add audio + best + cancel
+    buttons.append([
+        InlineKeyboardButton("🎵 Audio", callback_data="dl_q:audio"),
+        InlineKeyboardButton("✨ Best",  callback_data="dl_q:best"),
+    ])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dl_q:cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
 async def _pin_and_reply(client, message, status_msg):
-    """Pin the user's original message, then reply to pin for file delivery."""
-    pinned_msg = None
     try:
         if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
             await client.pin_chat_message(
                 message.chat.id, message.id, disable_notification=True
             )
-            pinned_msg = message
     except Exception:
         pass
-    return pinned_msg
 
 
 async def _start_download(client, orig_msg, url, quality, audio_only, status_msg):
-    """Run download with queue delay, reply to pinned message."""
     await asyncio.sleep(QUEUE_DELAY)
     await process_download(
-        client=client,
-        message=orig_msg,
-        url=url,
-        quality=quality,
-        audio_only=audio_only,
+        client=client, message=orig_msg, url=url,
+        quality=quality, audio_only=audio_only,
         status_msg=status_msg,
         platform=_PLATFORM_NAMES.get(detect_url_type(url), "Unknown"),
     )
 
 
-# ── URL handler ───────────────────────────────────────────────────────────────
+def _is_archive_url(url: str) -> bool:
+    """Check if URL points to an archive/binary (no quality choice needed)."""
+    path = url.split("?")[0].lower()
+    ext  = path.rsplit(".", 1)[-1] if "." in path else ""
+    return ext in _ARCHIVE_EXTS
+
+
+# ── URL handler ───────────────────────────────────────────────────────────
 
 @Client.on_message(
     filters.text & ~filters.outgoing & ~filters.command(_CMDS),
@@ -175,22 +233,69 @@ async def handle_url(client: Client, message: Message):
         )
         return
 
-    # YouTube — show quality selector
-    if url_type in _QUALITY_PLATFORMS:
-        await message.reply_text(
-            f"🔍 **{label} detected!**\n\n{B} `{short}`\n\n⚡ **Choose quality:**",
-            reply_markup=_quality_kb()
-        )
+    # APK / archive / binary — skip quality, download directly
+    if _is_archive_url(text) or url_type == "direct_doc":
+        sm = await message.reply_text(f"⏳ **Queuing {label} download...**")
+        await _pin_and_reply(client, message, sm)
+        job  = DownloadJob(user_id=user_id, url=text, quality="best", msg_id=sm.id)
+        _sm  = sm; _msg = message; _url = text
+
+        async def handler(j):
+            await _start_download(client, _msg, j.url, "best", False, _sm)
+
+        pos = await queue_manager.enqueue(job, handler)
+        try:
+            await sm.edit_text(
+                f"📋 **Queued!**\n\n"
+                f"{B} File: `{label}`\n"
+                f"{B} Position: `#{pos}`\n"
+                f"{B} URL: `{_url[:50]}`"
+            )
+        except Exception: pass
         return
 
-    # All other platforms — download immediately at best quality
+    # YouTube — fetch actual available formats, then show quality selector
+    if url_type in _QUALITY_PLATFORMS:
+        sm = await message.reply_text(
+            f"🔍 **{label} detected!**\n\n{B} `{short}`\n\n⏳ **Fetching available qualities...**"
+        )
+        heights = await _fetch_yt_formats(text)
+        if heights:
+            kb = _dynamic_quality_kb(heights)
+            qual_text = " · ".join(
+                {144:"144p",240:"240p",360:"360p",480:"480p",
+                 720:"720p",1080:"1080p",1440:"1440p",2160:"4K",4320:"8K"}.get(h, f"{h}p")
+                for h in heights
+            )
+            try:
+                await sm.edit_text(
+                    f"🔍 **{label} detected!**\n\n"
+                    f"{B} `{short}`\n\n"
+                    f"✅ **Available:** `{qual_text}`\n\n"
+                    f"⚡ **Choose quality:**",
+                    reply_markup=kb
+                )
+            except Exception:
+                await sm.edit_text(
+                    f"🔍 **{label} detected!**\n\n{B} `{short}`\n\n⚡ **Choose quality:**",
+                    reply_markup=_default_quality_kb()
+                )
+        else:
+            # Fallback to default keyboard
+            try:
+                await sm.edit_text(
+                    f"🔍 **{label} detected!**\n\n{B} `{short}`\n\n⚡ **Choose quality:**",
+                    reply_markup=_default_quality_kb()
+                )
+            except Exception: pass
+        return
+
+    # All other platforms — best quality, queue immediately
     sm = await message.reply_text(f"⏳ **Queuing {label} download...**")
     await _pin_and_reply(client, message, sm)
 
-    job = DownloadJob(user_id=user_id, url=text, quality="best", msg_id=sm.id)
-    _sm = sm
-    _msg = message
-    _url = text
+    job  = DownloadJob(user_id=user_id, url=text, quality="best", msg_id=sm.id)
+    _sm  = sm; _msg = message; _url = text
 
     async def handler(j):
         await _start_download(client, _msg, j.url, "best", False, _sm)
@@ -203,11 +308,10 @@ async def handle_url(client: Client, message: Message):
             f"{B} Position: `#{pos}`\n"
             f"{B} URL: `{_url[:50]}`"
         )
-    except Exception:
-        pass
+    except Exception: pass
 
 
-# ── Quality callback ──────────────────────────────────────────────────────────
+# ── Quality callback ──────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^dl_q:"))
 async def quality_cb(client: Client, query: CallbackQuery):
@@ -242,11 +346,7 @@ async def quality_cb(client: Client, query: CallbackQuery):
 
     job  = DownloadJob(user_id=user_id, url=url, quality=quality,
                       audio_only=audio_only, msg_id=sm.id)
-    _sm  = sm
-    _msg = query.message
-    _url = url
-    _q   = quality
-    _ao  = audio_only
+    _sm  = sm; _msg = query.message; _url = url; _q = quality; _ao = audio_only
 
     async def handler(j):
         await _start_download(client, _msg, j.url, _q, _ao, _sm)
@@ -259,11 +359,10 @@ async def quality_cb(client: Client, query: CallbackQuery):
             f"{B} Quality: `{quality}`\n"
             f"{B} URL: `{url[:50]}`"
         )
-    except Exception:
-        pass
+    except Exception: pass
 
 
-# ── Google Drive callbacks ─────────────────────────────────────────────────────
+# ── Google Drive callbacks ─────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^dl_gdrive:"))
 async def gdrive_choice_cb(client: Client, query: CallbackQuery):
@@ -293,11 +392,8 @@ async def gdrive_choice_cb(client: Client, query: CallbackQuery):
     except Exception:
         sm = await query.message.reply_text("⏳ Queuing...")
 
-    _sm   = sm
-    _msg  = query.message
-    _url  = url
-
-    job = DownloadJob(user_id=user_id, url=_url, quality="best", msg_id=sm.id)
+    _sm  = sm; _msg = query.message; _url = url
+    job  = DownloadJob(user_id=user_id, url=_url, quality="best", msg_id=sm.id)
 
     async def handler(j):
         await asyncio.sleep(QUEUE_DELAY)
@@ -312,8 +408,7 @@ async def gdrive_choice_cb(client: Client, query: CallbackQuery):
             f"{B} Position: `#{pos}`\n"
             f"{B} Mode: `{'ZIP Archive' if choice == 'zip' else 'Individual Files'}`"
         )
-    except Exception:
-        pass
+    except Exception: pass
 
 
 @Client.on_callback_query(filters.regex(r"^gdrive_(zip|individual)$"))
@@ -322,7 +417,7 @@ async def gdrive_receive_cb(client: Client, query: CallbackQuery):
     await handle_gdrive_choice(client, query, choice)
 
 
-# ── /audio ────────────────────────────────────────────────────────────────────
+# ── /audio ────────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("audio") & ~filters.outgoing)
 @ensure_registered
@@ -339,20 +434,22 @@ async def audio_cmd(client: Client, message: Message):
     user_id = message.from_user.id
     if not await _guard(message, user_id):
         return
-    sm = await message.reply_text("🎵 **Queuing audio extraction...**")
+    sm  = await message.reply_text("🎵 **Queuing audio extraction...**")
     job = DownloadJob(user_id=user_id, url=url, quality="audio", audio_only=True, msg_id=sm.id)
     _sm = sm
+
     async def handler(j):
         await asyncio.sleep(QUEUE_DELAY)
         await process_download(client, message, j.url, quality="audio",
                                audio_only=True, status_msg=_sm,
                                platform=_PLATFORM_NAMES.get(detect_url_type(j.url),"Unknown"))
+
     pos = await queue_manager.enqueue(job, handler)
     try: await sm.edit_text(f"📋 Queue `#{pos}` — 🎵 Audio extraction queued!")
     except: pass
 
 
-# ── /info ─────────────────────────────────────────────────────────────────────
+# ── /info ─────────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("info") & ~filters.outgoing)
 @ensure_registered
@@ -410,27 +507,27 @@ async def info_dl_cb(client: Client, query: CallbackQuery):
         return
     _pending_urls[user_id] = url
     url_type = detect_url_type(url)
-    if url_type in _QUALITY_PLATFORMS:
+    if url_type in _QUALITY_PLATFORMS and not _is_archive_url(url):
+        sm = await query.message.edit_text("⏳ **Fetching available qualities...**")
+        heights = await _fetch_yt_formats(url)
+        kb = _dynamic_quality_kb(heights) if heights else _default_quality_kb()
         try:
-            await query.message.edit_text(
-                f"⚡ **Choose quality:**",
-                reply_markup=_quality_kb()
-            )
-        except Exception:
-            pass
+            await sm.edit_text("⚡ **Choose quality:**", reply_markup=kb)
+        except Exception: pass
     else:
-        # Direct download
         sm = await query.message.edit_text("⏳ Queuing...")
         job = DownloadJob(user_id=user_id, url=url, quality="best", msg_id=sm.id)
         _sm = sm; _msg = query.message
+
         async def handler(j):
             await _start_download(client, _msg, j.url, "best", False, _sm)
+
         pos = await queue_manager.enqueue(job, handler)
         try: await sm.edit_text(f"📋 Queue `#{pos}` — Downloading...")
         except: pass
 
 
-# ── /cancel ───────────────────────────────────────────────────────────────────
+# ── /cancel ───────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("cancel") & ~filters.outgoing)
 async def cancel_cmd(client: Client, message: Message):
@@ -438,7 +535,7 @@ async def cancel_cmd(client: Client, message: Message):
     await message.reply_text("❌ **Cancelled.**")
 
 
-# ── Bulk .txt ─────────────────────────────────────────────────────────────────
+# ── Bulk .txt ─────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.document & ~filters.outgoing, group=1)
 @ensure_registered
@@ -465,12 +562,14 @@ async def handle_txt(client: Client, message: Message):
             s = await message.reply_text(f"⏳ `[{i}/{len(lines)}]` Queuing `{url[:40]}`...")
             job = DownloadJob(user_id=user_id, url=url, quality="best", msg_id=s.id)
             _s = s; _u = url
+
             async def make_h(_s=_s, _u=_u):
                 async def h(j):
                     await asyncio.sleep(QUEUE_DELAY)
                     await process_download(client, message, j.url, status_msg=_s,
                                            platform=_PLATFORM_NAMES.get(detect_url_type(j.url),"Unknown"))
                 return h
+
             await queue_manager.enqueue(job, await make_h())
             await asyncio.sleep(0.3)
         await sm.edit_text(f"✅ **All {len(lines)} URLs queued!**")
