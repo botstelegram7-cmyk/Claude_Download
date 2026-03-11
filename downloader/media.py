@@ -1,12 +1,10 @@
 """
 Serena Bot - Upload Pipeline
-Caption: ALWAYS platform original title — never filename
-All videos: supports_streaming=True (Telegram inline playback)
-
-FIXED:
-- _flood_send now accepts callable → no "cannot reuse already awaited coroutine"
-- Upload progress shows correctly with Uploading action
-- Thumbnail fetched from original URL first, then generated
+- No "cannot reuse coroutine" (callable-based _flood_send)
+- Upload progress with new fancy bar
+- Large file (>2GB): ask Split / GoFile / Direct Telegram
+- GoFile upload support
+- Thumbnail from source first, then generate
 """
 import os, sys, asyncio
 from typing import Optional, Callable
@@ -29,11 +27,14 @@ from downloader.core import (
 from utils.helpers import detect_url_type, fmt_size, fmt_duration, get_title_from_url
 from utils.progress import ProgressTracker, YtdlpProgressHook
 import database as db
+import config as _cfg
 
 VIDEO_EXTS = {"mp4","mkv","webm","avi","mov","flv","ts","m2ts","3gp","m4v","wmv"}
 AUDIO_EXTS = {"mp3","aac","flac","wav","ogg","m4a","opus","wma"}
 IMAGE_EXTS = {"jpg","jpeg","png","gif","webp","bmp","tiff"}
 
+# Pending large file choices: user_id → (fp, meta, message, status_msg, url, platform)
+_large_file_pending: dict = {}
 _gdrive_pending: dict = {}
 
 
@@ -47,12 +48,10 @@ async def _safe_edit(msg, text):
         except (MessageNotModified, Exception): return
 
 
-# ── FIX: Accept callable, not coroutine ──────────────────────────────────
 async def _flood_send(coro_fn: Callable, retries: int = 3):
     """
-    Pass a zero-arg callable returning a fresh coroutine each time.
-    Example: await _flood_send(lambda: client.send_video(...))
-    This avoids 'cannot reuse already awaited coroutine' on retry.
+    Accept a zero-arg callable returning fresh coroutine each call.
+    Fixes: 'cannot reuse already awaited coroutine'
     """
     last_exc = None
     for i in range(retries):
@@ -62,11 +61,9 @@ async def _flood_send(coro_fn: Callable, retries: int = 3):
             await asyncio.sleep(e.value + 2)
         except Exception as e:
             last_exc = e
-            if i == retries - 1:
-                raise
+            if i == retries - 1: raise
             await asyncio.sleep(2)
-    if last_exc:
-        raise last_exc
+    if last_exc: raise last_exc
 
 
 def _make_caption(url: str, filename: str, meta: Optional[dict],
@@ -77,22 +74,20 @@ def _make_caption(url: str, filename: str, meta: Optional[dict],
     if not title and url:
         title = get_title_from_url(url)
     if not title:
-        title = os.path.splitext(filename)[0]
-        title = title.replace("_", " ").replace("-", " ").strip()[:80]
+        title = os.path.splitext(filename)[0].replace("_"," ").replace("-"," ").strip()[:80]
     title = title[:80]
 
-    uploader = ""
-    duration = 0
-    views    = 0
+    uploader = duration = views = 0
+    uploader_str = ""
     if meta:
-        uploader = (meta.get("uploader") or meta.get("channel") or
-                    meta.get("artist") or meta.get("creator") or "").strip()[:40]
+        uploader_str = (meta.get("uploader") or meta.get("channel") or
+                        meta.get("artist") or meta.get("creator") or "").strip()[:40]
         duration = int(meta.get("duration") or 0)
         views    = int(meta.get("view_count") or 0)
 
-    ext = _ext(filename).upper() or (meta.get("ext", "").upper() if meta else "")
+    ext   = _ext(filename).upper() or (meta.get("ext","").upper() if meta else "")
     lines = [f"**{title}**"]
-    if uploader: lines.append(f"👤 `{uploader}`")
+    if uploader_str: lines.append(f"👤 `{uploader_str}`")
     stats = []
     if duration: stats.append(f"⏱ `{fmt_duration(duration)}`")
     stats.append(f"📦 `{fmt_size(file_size)}`")
@@ -101,6 +96,149 @@ def _make_caption(url: str, filename: str, meta: Optional[dict],
     if views >= 1000: lines.append(f"👁 `{views:,}` views")
     if platform:      lines.append(f"🌐 `{platform}`")
     return "\n".join(lines)
+
+
+# ── GoFile upload ─────────────────────────────────────────────────────────
+async def _upload_gofile(client, message, fp, meta, user_id, status_msg, url="", platform=""):
+    from utils.gofile import upload_to_gofile
+    token   = getattr(_cfg, "GOFILE_TOKEN", "")
+    title   = (meta or {}).get("title","") or os.path.basename(fp)
+    sz      = os.path.getsize(fp)
+    tracker = ProgressTracker(message=status_msg, title=title[:45],
+                               action="GoFile Upload", interval=3.5) if status_msg else None
+
+    if status_msg:
+        await _safe_edit(status_msg,
+            f"☁️ **Uploading to GoFile.io...**\n📦 `{fmt_size(sz)}`")
+
+    async def _cb(c, t):
+        if tracker: await tracker.uploading(c, t)
+
+    result = await upload_to_gofile(fp, token=token, progress_cb=_cb)
+
+    cap = (
+        f"**{title[:60]}**\n"
+        f"📦 `{fmt_size(sz)}`\n"
+        f"☁️ Uploaded to GoFile.io\n\n"
+        f"🔗 [Download Link]({result['link']})"
+    )
+    if status_msg:
+        await _safe_edit(status_msg, cap)
+    else:
+        await client.send_message(message.chat.id, cap,
+                                   reply_to_message_id=message.id,
+                                   disable_web_page_preview=True)
+    await db.log_download(user_id, url, title=title, file_size=sz, status="done")
+    await db.increment_daily_count(user_id)
+    cleanup_files(fp)
+
+
+# ── Split file into Telegram-safe parts ──────────────────────────────────
+async def _split_and_send(client, message, fp, meta, user_id, status_msg, url="", platform=""):
+    import subprocess, math
+    sz       = os.path.getsize(fp)
+    part_sz  = 1900 * 1024 * 1024   # 1.9 GB per part
+    n_parts  = math.ceil(sz / part_sz)
+    title    = (meta or {}).get("title","") or os.path.basename(fp)
+    out_base = fp + ".part"
+
+    if status_msg:
+        await _safe_edit(status_msg, f"✂️ **Splitting into {n_parts} parts...**")
+
+    # Use split command (available on Linux)
+    loop = asyncio.get_event_loop()
+    def _do_split():
+        subprocess.run(
+            ["split", "-b", str(part_sz), fp, out_base],
+            check=True
+        )
+    try:
+        await loop.run_in_executor(None, _do_split)
+    except Exception as e:
+        if status_msg:
+            await _safe_edit(status_msg, f"❌ Split failed: `{e}`")
+        return
+
+    import glob
+    parts = sorted(glob.glob(out_base + "*"))
+    for i, part in enumerate(parts, 1):
+        pname = f"{title[:40]} Part {i}/{len(parts)}"
+        psz   = os.path.getsize(part)
+        if status_msg:
+            await _safe_edit(status_msg, f"📤 **Sending Part {i}/{len(parts)}** `{fmt_size(psz)}`...")
+        tracker = ProgressTracker(message=status_msg, title=pname[:45],
+                                   action="Uploading", interval=4.0)
+        async def _cb(c, t): await tracker.uploading(c, t)
+        _part = part
+        await _flood_send(lambda: client.send_document(
+            chat_id=message.chat.id,
+            document=_part,
+            caption=f"📦 **{pname}**\n`{fmt_size(psz)}`",
+            reply_to_message_id=message.id,
+            progress=_cb,
+        ))
+        cleanup_files(part)
+        await asyncio.sleep(1)
+
+    if status_msg:
+        await _safe_edit(status_msg, f"✅ **All {len(parts)} parts sent!**")
+    await db.log_download(user_id, url, title=title, file_size=sz, status="done")
+    await db.increment_daily_count(user_id)
+    cleanup_files(fp)
+
+
+# ── Large file prompt ─────────────────────────────────────────────────────
+async def _prompt_large_file(client, message, fp, meta, user_id, status_msg, url, platform):
+    """Ask user what to do with a file that exceeds Telegram's 2 GB limit."""
+    sz    = os.path.getsize(fp)
+    title = (meta or {}).get("title","") or os.path.basename(fp)
+    has_gofile = bool(getattr(_cfg, "GOFILE_TOKEN", ""))
+
+    _large_file_pending[user_id] = (fp, meta, message, status_msg, url, platform)
+
+    buttons = [[InlineKeyboardButton("✂️ Split Parts", callback_data="lf:split")]]
+    if has_gofile:
+        buttons.append([InlineKeyboardButton("☁️ GoFile.io", callback_data="lf:gofile")])
+    buttons.append([InlineKeyboardButton("📤 Force Telegram", callback_data="lf:force")])
+    buttons.append([InlineKeyboardButton("❌ Cancel",         callback_data="lf:cancel")])
+
+    try:
+        await status_msg.edit_text(
+            f"⚠️ **File too large for Telegram!**\n\n"
+            f"📄 `{title[:50]}`\n"
+            f"📦 `{fmt_size(sz)}`\n\n"
+            f"Telegram max = 2 GB. How should I send it?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    except Exception:
+        pass
+
+
+# ── Large file callback (called from download.py) ─────────────────────────
+async def handle_large_file_choice(client, query, choice):
+    uid = query.from_user.id
+    pending = _large_file_pending.pop(uid, None)
+    if not pending:
+        await query.answer("⚠️ Session expired.", show_alert=True)
+        return
+    fp, meta, orig_msg, sm, url, platform = pending
+    await query.answer()
+
+    if choice == "cancel":
+        cleanup_files(fp)
+        try: await sm.edit_text("❌ Cancelled.")
+        except: pass
+        return
+
+    if choice == "gofile":
+        await _upload_gofile(client, orig_msg, fp, meta, uid, sm, url, platform)
+    elif choice == "split":
+        await _split_and_send(client, orig_msg, fp, meta, uid, sm, url, platform)
+    else:  # force — try sending directly, may fail for very large files
+        await _upload_single(client, orig_msg, fp, meta, uid, None, sm, url, platform)
+
+    try: await sm.delete()
+    except: pass
 
 
 # ── Google Drive choice handler ───────────────────────────────────────────
@@ -112,21 +250,19 @@ async def handle_gdrive_choice(client, query, choice):
     files, meta, out_dir, orig_msg, sm = pending
     await query.answer()
     try:
-        name = (meta or {}).get("title", "Google Drive Files") if meta else "Google Drive Files"
+        name = (meta or {}).get("title","Google Drive Files") if meta else "Google Drive Files"
         if choice == "zip":
             await _safe_edit(sm, "📦 **Creating ZIP...**")
             zp = await zip_folder(out_dir, f"/tmp/serena_dl/{uid}", name)
             sz = os.path.getsize(zp)
-            t  = ProgressTracker(message=sm, title=name[:35], action="Uploading", interval=3.5)
+            t  = ProgressTracker(message=sm, title=name[:45], action="Uploading", interval=3.5)
             await _safe_edit(sm, f"📤 **Uploading** `{fmt_size(sz)}`...")
-
             async def _cb(c, tot): await t.uploading(c, tot)
             _zp = zp
             await _flood_send(lambda: client.send_document(
                 chat_id=orig_msg.chat.id, document=_zp,
                 caption=f"📦 **{name[:60]}**\n📂 `{len(files)} files` · `{fmt_size(sz)}`",
-                reply_to_message_id=orig_msg.id,
-                progress=_cb,
+                reply_to_message_id=orig_msg.id, progress=_cb,
             ))
             await db.log_download(uid, "gdrive", title=name, file_size=sz, status="done")
             await db.increment_daily_count(uid)
@@ -165,7 +301,7 @@ async def process_download(
     os.makedirs(out_dir, exist_ok=True)
 
     pre_title = get_title_from_url(url)
-    tracker = ProgressTracker(
+    tracker   = ProgressTracker(
         message=status_msg, title=pre_title,
         action="Downloading", interval=3.5,
     ) if status_msg else None
@@ -174,33 +310,28 @@ async def process_download(
     fp = meta = None
 
     try:
-        # ── M3U8 ──────────────────────────────────────────────────────────
         if url_type == "m3u8":
             if status_msg:
                 await _safe_edit(status_msg, "📡 **Downloading stream...**\n⏱ Max 5 minutes.")
             fp, meta = await download_m3u8(url, out_dir)
 
-        # ── Direct file ───────────────────────────────────────────────────
-        elif url_type in ("direct_video", "direct_audio", "direct_image", "direct_doc"):
+        elif url_type in ("direct_video","direct_audio","direct_image","direct_doc"):
             async def _dh(c, t):
                 if tracker: await tracker.hook(c, t)
             if status_msg: await _safe_edit(status_msg, "⬇️ **Downloading...**")
             fp, meta = await download_direct(url, out_dir, progress_hook=_dh)
 
-            # Archive / APK / binary — send as document directly
-            if fp and _ext(fp) in ("zip","rar","tar","7z","apk","exe","dmg","iso","bin","pkg"):
+            if fp and _ext(fp) in ("zip","rar","tar","7z","apk","xapk","exe","dmg","iso","bin","pkg","msi","deb"):
                 sz    = os.path.getsize(fp)
                 title = (meta or {}).get("title","") or get_title_from_url(url) or os.path.basename(fp)
-                t     = ProgressTracker(message=status_msg, title=title[:35], action="Uploading", interval=3.5)
+                t     = ProgressTracker(message=status_msg, title=title[:45], action="Uploading", interval=3.5)
                 await _safe_edit(status_msg, f"📤 **Uploading** `{fmt_size(sz)}`...")
-
                 async def _cb(c, tot): await t.uploading(c, tot)
                 _fp2 = fp
                 await _flood_send(lambda: client.send_document(
                     chat_id=message.chat.id, document=_fp2,
                     caption=f"📦 **{title[:60]}**\n📦 `{fmt_size(sz)}`",
-                    reply_to_message_id=message.id,
-                    progress=_cb,
+                    reply_to_message_id=message.id, progress=_cb,
                 ))
                 await db.log_download(user_id, url, title=title, file_size=sz, status="done")
                 await db.increment_daily_count(user_id)
@@ -210,7 +341,6 @@ async def process_download(
                     except: pass
                 return True
 
-        # ── Google Drive folder ────────────────────────────────────────────
         elif url_type == "gdrive" and "/drive/folders/" in url:
             if status_msg: await _safe_edit(status_msg, "📁 **Fetching Drive folder...**")
             files, meta = await download_gdrive_folder(url, out_dir)
@@ -228,14 +358,13 @@ async def process_download(
                     f"🗃 `{len(files)} files` · `{fmt_size(total_s)}`\n\n"
                     f"**How to receive?**",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("📦 ZIP", callback_data="gdrive_zip"),
-                        InlineKeyboardButton("📂 Individual", callback_data="gdrive_individual"),
+                        InlineKeyboardButton("📦 ZIP",       callback_data="gdrive_zip"),
+                        InlineKeyboardButton("📂 Individual",callback_data="gdrive_individual"),
                     ]])
                 )
             except Exception: pass
             return True
 
-        # ── yt-dlp (YouTube, Instagram, TikTok, Twitter, etc.) ────────────
         else:
             if status_msg: await _safe_edit(status_msg, "🔍 **Fetching info...**")
             try:
@@ -243,7 +372,7 @@ async def process_download(
                 def _get_title():
                     with yt_dlp.YoutubeDL({"quiet":True,"no_warnings":True}) as ydl:
                         i = ydl.extract_info(url, download=False)
-                        return (i.get("title") or "")[:35] if i else ""
+                        return (i.get("title") or "")[:45] if i else ""
                 t = await loop.run_in_executor(None, _get_title)
                 if t and tracker: tracker.title = t
             except Exception: pass
@@ -256,29 +385,37 @@ async def process_download(
             await db.log_download(user_id, url, status="failed")
             return False
 
-        # Playlist → ZIP
         if isinstance(fp, list):
             name = (meta or {}).get("title","playlist") if meta else "playlist"
             if status_msg: await _safe_edit(status_msg, "📦 **Zipping playlist...**")
             zp = await zip_folder(out_dir, f"/tmp/serena_dl/{user_id}", name)
             sz = os.path.getsize(zp)
-            t  = ProgressTracker(message=status_msg, title=name[:35], action="Uploading", interval=3.5)
+            t  = ProgressTracker(message=status_msg, title=name[:45], action="Uploading", interval=3.5)
             await _safe_edit(status_msg, f"📤 **Uploading ZIP** `{fmt_size(sz)}`...")
-
             async def _cb(c, tot): await t.uploading(c, tot)
             _zp = zp
             await _flood_send(lambda: client.send_document(
                 chat_id=message.chat.id, document=_zp,
                 caption=f"📦 **{name[:60]}**\n📂 `{len(fp)} files` · `{fmt_size(sz)}`",
-                reply_to_message_id=message.id,
-                progress=_cb,
+                reply_to_message_id=message.id, progress=_cb,
             ))
             await db.log_download(user_id, url, title=name, file_size=sz, status="done")
             await db.increment_daily_count(user_id)
             cleanup_files(zp)
         else:
-            await _upload_single(client, message, fp, meta, user_id,
-                                  tracker, status_msg, url=url, platform=platform)
+            # ── Large file check ──────────────────────────────────────────
+            file_sz   = os.path.getsize(fp)
+            max_size  = getattr(_cfg, "TG_MAX_SIZE", 2 * 1024 * 1024 * 1024)
+            user      = await db.get_user(user_id)
+            is_owner  = user_id in getattr(_cfg, "OWNER_IDS", [])
+            # No size limit for owners
+            if file_sz > max_size and not is_owner:
+                await _prompt_large_file(client, message, fp, meta,
+                                          user_id, status_msg, url, platform)
+                return True  # status_msg kept alive for callback
+            else:
+                await _upload_single(client, message, fp, meta, user_id,
+                                      tracker, status_msg, url=url, platform=platform)
 
         if status_msg:
             try: await status_msg.delete()
@@ -291,7 +428,7 @@ async def process_download(
         await db.log_download(user_id, url, status="failed")
         return False
     finally:
-        if user_id not in _gdrive_pending:
+        if user_id not in _gdrive_pending and user_id not in _large_file_pending:
             cleanup_files(out_dir)
 
 
@@ -306,12 +443,10 @@ async def _upload_single(client, message, fp, meta, user_id,
     ext       = _ext(fp)
     cap       = _make_caption(url, orig_name, meta, file_size, platform)
 
-    # Switch tracker to Uploading mode
     if tracker:
         tracker.action = "Uploading"
-        if meta: tracker.title = (meta.get("title") or "")[:35]
+        if meta: tracker.title = (meta.get("title") or "")[:45]
 
-    # Video detection
     is_video = ext in VIDEO_EXTS
     if not is_video and meta:
         if (meta.get("ext","").lower() in VIDEO_EXTS or
@@ -334,13 +469,10 @@ async def _upload_single(client, message, fp, meta, user_id,
             fp = remuxed
 
         thumb = None
-        # Priority 1: URL from yt-dlp metadata
         if meta:
             tu = meta.get("thumbnail"); tid = meta.get("id","temp")
             if tu: thumb = download_thumb_from_url(tu, tid)
-        # Priority 2: file beside video
         if not thumb: thumb = find_thumbnail(fp)
-        # Priority 3: generate from frame
         if not thumb:
             if status_msg: await _safe_edit(status_msg, "🖼️ **Generating thumbnail...**")
             thumb = await generate_thumbnail(fp)
@@ -369,18 +501,14 @@ async def _upload_single(client, message, fp, meta, user_id,
         artist = (meta.get("uploader") or meta.get("artist") or "").strip() if meta else ""
         if not title:
             title = get_title_from_url(url) or os.path.splitext(orig_name)[0]
-
         thumb = find_thumbnail(fp)
         if not thumb and meta:
             tu = meta.get("thumbnail")
             if tu: thumb = download_thumb_from_url(tu, meta.get("id","temp"))
-
         if status_msg: await _safe_edit(status_msg, f"📤 **Uploading audio** `{fmt_size(file_size)}`...")
-
         _fp, _thumb, _cap, _title, _artist, _tr = fp, thumb, cap, title, artist, tracker
         async def _up_cb(c, t):
             if _tr: await _tr.uploading(c, t)
-
         await _flood_send(lambda: client.send_audio(
             chat_id=message.chat.id, audio=_fp, thumb=_thumb, caption=_cap,
             title=_title[:64] if _title else None,

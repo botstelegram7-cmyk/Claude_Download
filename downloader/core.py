@@ -233,6 +233,9 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
             "fragment_retries": 3, "socket_timeout": 30,
             "http_headers": {"User-Agent": CHROME_UA},
             "extractor_args": ea,
+            # Geo-bypass: pretend to be in India (most content is available there)
+            "geo_bypass": True,
+            "geo_bypass_country": "IN",
         }
         if YT_PROXY:
             o["proxy"] = YT_PROXY
@@ -272,6 +275,8 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
             "socket_timeout": 30,
             "http_headers": {"User-Agent": CHROME_UA},
             "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+            "geo_bypass": True,
+            "geo_bypass_country": "IN",
             **({} if not YT_PROXY else {"proxy": YT_PROXY}),
             **({} if not cookie_file else {"cookiefile": cookie_file}),
             **({} if not hook else {"progress_hooks": [hook]}),
