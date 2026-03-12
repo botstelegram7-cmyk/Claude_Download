@@ -249,32 +249,48 @@ async def _yt_download(url, out_dir, quality, audio_only, hook) -> tuple:
             o["progress_hooks"] = [hook]
         return o
 
-    # ── Strategy order: embed clients FIRST ──────────────────────────────
+    # ── Strategy order ────────────────────────────────────────────────────
+    # "page needs to be reloaded" = web/mweb JS challenge
+    # Fix: use android_vr/ios/android first (no JS page load needed)
     strategies = [
-        _make(["web_embedded"]),
-        _make(["tv_embedded"]),
-        _make(["web_embedded", "tv_embedded"]),
+        # Tier 1: Mobile clients — skip webpage JS entirely
+        _make(["android_vr"],      {"youtube": {"player_client": ["android_vr"],
+                                                 "player_skip": ["webpage","configs","js"]}}),
+        _make(["ios"],             {"youtube": {"player_client": ["ios"],
+                                                 "player_skip": ["webpage","configs","js"]}}),
+        _make(["android"],         {"youtube": {"player_client": ["android"],
+                                                 "player_skip": ["webpage","configs","js"]}}),
+        # Tier 2: Embedded clients
+        _make(["tv_embedded"],     {"youtube": {"player_client": ["tv_embedded"],
+                                                 "player_skip": ["webpage","configs"]}}),
+        _make(["web_embedded"],    {"youtube": {"player_client": ["web_embedded"],
+                                                 "player_skip": ["webpage"]}}),
         _make(["tv_embedded", "web_embedded"]),
-        _make(["android"], {"youtube": {"player_client": ["android"],
-                                         "player_skip": ["webpage","configs"]}}),
-        _make(["android_vr"], {"youtube": {"player_client": ["android_vr"],
-                                            "player_skip": ["webpage","configs"]}}),
-        _make(["ios"], {"youtube": {"player_client": ["ios"],
-                                     "player_skip": ["webpage","configs"]}}),
+        _make(["web_embedded", "tv_embedded"]),
+        # Tier 3: Other clients
+        _make(["android_testsuite"], {"youtube": {"player_client": ["android_testsuite"],
+                                                   "player_skip": ["webpage","configs","js"]}}),
+        _make(["android_creator"],   {"youtube": {"player_client": ["android_creator"],
+                                                   "player_skip": ["webpage","configs","js"]}}),
         _make(["mediaconnect"]),
         _make(["mweb"]),
-        _make(["android_testsuite"]),
-        # Default fallback with explicit extractor args
+        # Tier 4: Final fallback — all mobile clients together
         {
             "format": fmt,
             "outtmpl": os.path.join(out_dir, "%(title).100s.%(ext)s"),
             "merge_output_format": "mp4",
             "quiet": True, "no_warnings": True,
             "noplaylist": False, "writethumbnail": True,
-            "postprocessors": [], "retries": 2,
+            "postprocessors": [], "retries": 3,
             "socket_timeout": 30,
+            "sleep_interval_requests": 1,
             "http_headers": {"User-Agent": CHROME_UA},
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android_vr","ios","android","tv_embedded"],
+                    "player_skip": ["webpage","configs","js"],
+                }
+            },
             "geo_bypass": True,
             "geo_bypass_country": "IN",
             **({} if not YT_PROXY else {"proxy": YT_PROXY}),

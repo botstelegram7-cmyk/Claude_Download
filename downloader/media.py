@@ -188,26 +188,36 @@ async def _split_and_send(client, message, fp, meta, user_id, status_msg, url=""
 
 
 # ── Large file prompt ─────────────────────────────────────────────────────
-async def _prompt_large_file(client, message, fp, meta, user_id, status_msg, url, platform):
-    """Ask user what to do with a file that exceeds Telegram's 2 GB limit."""
-    sz    = os.path.getsize(fp)
-    title = (meta or {}).get("title","") or os.path.basename(fp)
+async def _prompt_large_file(client, message, fp, meta, user_id, status_msg, url, platform,
+                              is_owner: bool = False):
+    """
+    Ask user what to do with a file >2 GB.
+    Owners get an extra "📤 Send Full" option (direct upload attempt).
+    """
+    sz         = os.path.getsize(fp)
+    title      = (meta or {}).get("title","") or os.path.basename(fp)
     has_gofile = bool(getattr(_cfg, "GOFILE_TOKEN", ""))
 
     _large_file_pending[user_id] = (fp, meta, message, status_msg, url, platform)
 
-    buttons = [[InlineKeyboardButton("✂️ Split Parts", callback_data="lf:split")]]
+    buttons = []
+    # Owner: full send option at top
+    if is_owner:
+        buttons.append([InlineKeyboardButton("📤 Send Full (Owner)", callback_data="lf:force")])
+    buttons.append([InlineKeyboardButton("✂️ Split Parts", callback_data="lf:split")])
     if has_gofile:
         buttons.append([InlineKeyboardButton("☁️ GoFile.io", callback_data="lf:gofile")])
-    buttons.append([InlineKeyboardButton("📤 Force Telegram", callback_data="lf:force")])
-    buttons.append([InlineKeyboardButton("❌ Cancel",         callback_data="lf:cancel")])
+    if not is_owner:
+        buttons.append([InlineKeyboardButton("📤 Force Telegram", callback_data="lf:force")])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="lf:cancel")])
 
+    owner_note = "\n👑 _As Owner you can attempt full upload._" if is_owner else ""
     try:
         await status_msg.edit_text(
-            f"⚠️ **File too large for Telegram!**\n\n"
+            f"⚠️ **File exceeds 2 GB limit!**\n\n"
             f"📄 `{title[:50]}`\n"
             f"📦 `{fmt_size(sz)}`\n\n"
-            f"Telegram max = 2 GB. How should I send it?",
+            f"Choose how to deliver it:{owner_note}",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
     except Exception:
@@ -404,14 +414,16 @@ async def process_download(
             cleanup_files(zp)
         else:
             # ── Large file check ──────────────────────────────────────────
-            file_sz   = os.path.getsize(fp)
-            max_size  = getattr(_cfg, "TG_MAX_SIZE", 2 * 1024 * 1024 * 1024)
-            user      = await db.get_user(user_id)
-            is_owner  = user_id in getattr(_cfg, "OWNER_IDS", [])
-            # No size limit for owners
-            if file_sz > max_size and not is_owner:
+            file_sz  = os.path.getsize(fp)
+            max_size = getattr(_cfg, "TG_MAX_SIZE", 2 * 1024 * 1024 * 1024)
+            is_owner = user_id in getattr(_cfg, "OWNER_IDS", [])
+
+            if file_sz > max_size:
+                # Everyone (including owner) gets a choice prompt.
+                # Owner gets extra "Send Full" button at the top.
                 await _prompt_large_file(client, message, fp, meta,
-                                          user_id, status_msg, url, platform)
+                                          user_id, status_msg, url, platform,
+                                          is_owner=is_owner)
                 return True  # status_msg kept alive for callback
             else:
                 await _upload_single(client, message, fp, meta, user_id,
