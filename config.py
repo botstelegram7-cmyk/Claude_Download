@@ -58,3 +58,7 @@ GOFILE_ACCOUNT_ID: str = os.environ.get("GOFILE_ACCOUNT_ID", "")
 # Max Telegram upload size (bytes). Telegram MTProto limit = 2 GB.
 # Files above this threshold ask user: Split / GoFile / Direct Telegram.
 TG_MAX_SIZE: int = int(os.environ.get("TG_MAX_SIZE", str(2 * 1024 * 1024 * 1024)))  # 2 GB default
+
+# Extra bot tokens for multi-reaction (comma-separated)
+# e.g. REACTION_TOKENS=token1,token2,token3
+REACTION_TOKENS: str = os.environ.get("REACTION_TOKENS", "")
